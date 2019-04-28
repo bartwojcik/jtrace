@@ -1,0 +1,11 @@
+[package]
+name = "jtrace"
+version = "0.1.0"
+authors = ["Bartosz Wojcik <bartwojc@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+exitfailure = "0.5.1"
+nix = "0.13.0"
+clap = "2.33.0"
+structopt = "0.2.15"
