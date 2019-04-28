@@ -14,8 +14,12 @@ struct Cli {
     /// The path to the executable
     #[structopt(parse(from_os_str))]
     path: Option<std::path::PathBuf>,
+    /// PID of the process to attach to
     #[structopt(short = "p", long = "pid")]
     pid: Option<u32>,
+    /// Trace child processes as they are created by currently traced processes
+    #[structopt(short = "f", long = "follow")]
+    follow: bool,
 }
 
 /// Converts an int value to a ptrace Event enum.
@@ -36,21 +40,21 @@ fn int_to_ptrace_event(value: i32) -> Option<Event> {
 
 fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let child_pid: Pid;
-    let ptrace_options: Options;
+    let mut ptrace_options = Options::empty();
+
+    if args.follow {
+        ptrace_options |= Options::PTRACE_O_TRACEFORK
+            | Options::PTRACE_O_TRACEVFORK
+            | Options::PTRACE_O_TRACECLONE;
+    }
     if let Some(path) = args.path {
         let child = Command::new(&path).spawn()?;
         child_pid = Pid::from_raw(child.id() as i32);
         println!("Running {:?} in {}", path, child_pid);
-        ptrace_options = Options::PTRACE_O_TRACEFORK
-            | Options::PTRACE_O_TRACEVFORK
-            | Options::PTRACE_O_TRACECLONE
-            | Options::PTRACE_O_EXITKILL;
+        ptrace_options |= Options::PTRACE_O_EXITKILL;
     } else if let Some(pid) = args.pid {
         child_pid = Pid::from_raw(pid as i32);
         println!("Attaching to {}", child_pid);
-        ptrace_options = Options::PTRACE_O_TRACEFORK
-            | Options::PTRACE_O_TRACEVFORK
-            | Options::PTRACE_O_TRACECLONE;
     } else {
         // TODO implement this with structopt and panic here instead
         return Err(Box::new(clap::Error::with_description(
@@ -58,6 +62,7 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
             clap::ErrorKind::MissingRequiredArgument,
         )));
     }
+    let ptrace_options = ptrace_options;
 
     attach(child_pid)?;
     waitpid(child_pid, None)?;
