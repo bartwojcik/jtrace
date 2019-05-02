@@ -1,25 +1,28 @@
 use core::borrow::Borrow;
 use std::error::Error;
-use std::process::Command;
+use std::ffi::CString;
 
 use clap;
-use nix::sys::ptrace::{attach, cont, getevent, setoptions, Event, Options};
+use log::{debug, error, info, trace, warn};
+use nix::sys::ptrace::{attach, cont, getevent, setoptions, traceme, Event, Options};
+use nix::sys::signal::{raise, Signal};
 use nix::sys::wait::{wait, waitpid, WaitStatus};
-use nix::unistd::Pid;
+use nix::unistd::ForkResult::Parent;
+use nix::unistd::{execv, fork, Pid};
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
 /// Trace the execution path of a program.
 struct Cli {
-    /// The path to the executable
-    #[structopt(parse(from_os_str))]
-    path: Option<std::path::PathBuf>,
     /// PID of the process to attach to
     #[structopt(short = "p", long = "pid")]
     pid: Option<u32>,
     /// Trace child processes as they are created by currently traced processes
     #[structopt(short = "f", long = "follow")]
     follow: bool,
+    /// The command to be executed
+    #[structopt(raw(multiple = "true"))]
+    command: Vec<String>,
 }
 
 /// Converts an int value to a ptrace Event enum.
@@ -38,53 +41,22 @@ fn int_to_ptrace_event(value: i32) -> Option<Event> {
     }
 }
 
-fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let child_pid: Pid;
-    let mut ptrace_options = Options::empty();
-
-    if args.follow {
-        ptrace_options |= Options::PTRACE_O_TRACEFORK
-            | Options::PTRACE_O_TRACEVFORK
-            | Options::PTRACE_O_TRACECLONE;
-    }
-    if let Some(path) = args.path {
-        let child = Command::new(&path).spawn()?;
-        child_pid = Pid::from_raw(child.id() as i32);
-        println!("Running {:?} in {}", path, child_pid);
-        ptrace_options |= Options::PTRACE_O_EXITKILL;
-    } else if let Some(pid) = args.pid {
-        child_pid = Pid::from_raw(pid as i32);
-        println!("Attaching to {}", child_pid);
-    } else {
-        // TODO implement this with structopt and panic here instead
-        return Err(Box::new(clap::Error::with_description(
-            "Either path to binary or process PID must be given",
-            clap::ErrorKind::MissingRequiredArgument,
-        )));
-    }
-    let ptrace_options = ptrace_options;
-
-    attach(child_pid)?;
-    waitpid(child_pid, None)?;
-    println!("Attached to {}", child_pid);
-
-    setoptions(child_pid, ptrace_options)?;
-    cont(child_pid, None)?;
-
-    let mut traced_pids = vec![child_pid.as_raw()];
+fn trace(pid: Pid) -> Result<(), Box<dyn std::error::Error>> {
+    let mut traced_pids = vec![pid.as_raw()];
     loop {
+        trace!("Tracer waiting");
         let wait_result = wait()?;
         if let Some(pid) = wait_result.pid() {
             if let Ok(_) = traced_pids.binary_search(&pid.as_raw()) {
                 let waited_pid = match wait_result {
                     WaitStatus::Continued(pid) => {
-                        println!("Continued: pid {}", pid);
+                        debug!("Continued: pid {}", pid);
                         Some(pid)
                     }
                     WaitStatus::Exited(pid, ret) => {
-                        println!("Exited: pid {}, ret {}", pid, ret);
+                        debug!("Exited: pid {}, ret {}", pid, ret);
                         if let Ok(pos) = traced_pids.binary_search(&pid.as_raw()) {
-                            traced_pids.remove(pos);
+                            traced_pids.swap_remove(pos);
                             if traced_pids.is_empty() {
                                 return Ok(());
                             }
@@ -92,7 +64,7 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         None
                     }
                     WaitStatus::PtraceEvent(pid, signal, value) => {
-                        println!(
+                        debug!(
                             "PtraceEvent: pid {}, signal {}, value {:?}",
                             pid,
                             signal,
@@ -102,24 +74,25 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             Ok(pid_raw) => {
                                 if let Err(pos) = traced_pids.binary_search(&(pid_raw as i32)) {
                                     traced_pids.insert(pos, pid_raw as i32);
+                                    trace!("Added {} to the list of traced PIDs", pid_raw);
                                 } else {
                                     // TODO panic instead?
-                                    eprintln!("New process's PID already traced, ignoring");
+                                    warn!("New process's PID already traced, ignoring");
                                 }
                             }
-                            Err(e) => {
+                            Err(_e) => {
                                 // TODO panic instead?
-                                eprintln!("PTRACE_GETEVENTMSG did not return a PID after fork, continuing");
+                                warn!("PTRACE_GETEVENTMSG did not return a PID after fork, continuing");
                             }
                         };
                         Some(pid)
                     }
                     WaitStatus::PtraceSyscall(pid) => {
-                        println!("PtraceSyscall: pid {}", pid);
+                        debug!("PtraceSyscall: pid {}", pid);
                         Some(pid)
                     }
                     WaitStatus::Signaled(pid, signal, dumped) => {
-                        println!(
+                        debug!(
                             "Signaled: pid {}, signal {}, dumped {}",
                             pid, signal, dumped
                         );
@@ -129,11 +102,12 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         panic!("WaitStatus::StillAlive should not happen in synchronous calls!");
                     }
                     WaitStatus::Stopped(pid, signal) => {
-                        println!("Stopped: pid {}, signal {}", pid, signal);
+                        debug!("Stopped: pid {}, signal {}", pid, signal);
                         Some(pid)
                     }
                 };
                 if let Some(pid) = waited_pid {
+                    trace!("Continuing PID {}", pid);
                     cont(pid, None)?;
                 }
             }
@@ -141,15 +115,66 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let child_pid: Pid;
+    let mut ptrace_options = Options::empty();
+
+    if args.follow {
+        ptrace_options |= Options::PTRACE_O_TRACEFORK
+            | Options::PTRACE_O_TRACEVFORK
+            | Options::PTRACE_O_TRACECLONE;
+    }
+
+    if let Some(pid) = args.pid {
+        // TODO support attaching to PID + its all current children
+        child_pid = Pid::from_raw(pid as i32);
+        attach(child_pid)?;
+        info!("Attached to {}", child_pid);
+    } else if args.command.len() > 0 {
+        let fork_result = fork()?;
+        if let Parent { child } = fork_result {
+            child_pid = child;
+            info!("Running {} attached in {}", args.command[0], child_pid);
+            ptrace_options |= Options::PTRACE_O_EXITKILL;
+            waitpid(child_pid, None)?;
+        } else {
+            traceme()?;
+            let command_args: Vec<CString> = args
+                .command
+                .into_iter()
+                .map(|s| CString::new(s).unwrap())
+                .collect();
+            raise(Signal::SIGSTOP)?;
+            // TODO implement passing environment variables to command
+            execv(&command_args[0], &command_args[1..])?;
+            panic!("Should never reach anything after execv!");
+        }
+    } else {
+        // TODO implement this with structopt and panic here instead
+        return Err(Box::new(clap::Error::with_description(
+            "Either command or process PID must be given",
+            clap::ErrorKind::MissingRequiredArgument,
+        )));
+    }
+    let ptrace_options = ptrace_options;
+
+    setoptions(child_pid, ptrace_options)?;
+    cont(child_pid, None)?;
+
+    trace(child_pid)
+}
+
 fn main() {
+    env_logger::init();
+
     let args = Cli::from_args();
 
     if let Err(top_e) = run(args) {
-        eprintln!("{}", top_e.to_string());
+        error!("{}", top_e.to_string());
         let mut e: &Error = top_e.borrow();
         loop {
             if let Some(source) = e.source() {
-                eprintln!("Caused by: {}", source.to_string());
+                error!("Caused by: {}", source.to_string());
                 e = source;
             } else {
                 break;

@@ -6,6 +6,8 @@ edition = "2018"
 
 [dependencies]
 exitfailure = "0.5.1"
+log = "0.4.6"
+env_logger = "0.6.1"
 nix = "0.13.0"
 clap = "2.33.0"
 structopt = "0.2.15"
