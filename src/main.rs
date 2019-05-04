@@ -10,7 +10,7 @@ use capstone::prelude::*;
 use clap;
 use log::{debug, error, info, trace, warn};
 use nix::sys::ptrace::{attach, cont, read, setoptions, traceme, write, Event, Options};
-use nix::sys::signal::SIGSTOP;
+use nix::sys::signal::{SIGSTOP, SIGTRAP};
 use nix::sys::uio::{process_vm_readv, IoVec, RemoteIoVec};
 use nix::sys::wait::{wait, WaitStatus};
 use nix::unistd::Pid;
@@ -160,7 +160,7 @@ fn find_jumps(code_regions: &CodeRegions) -> Result<JumpAddresses, Box<dyn std::
     Ok(jump_addresses)
 }
 
-const BREAKPOINT_TRAP_X86: u8 = 0xCC;
+const TRAP_X86: u8 = 0xCC;
 
 fn set_branch_breakpoints(
     pid: Pid,
@@ -173,8 +173,8 @@ fn set_branch_breakpoints(
 
         unsafe {
             let read = read(pid, aligned_addr as *const u64 as *mut c_void)?;
-            let mut buf: [u8; std::mem::size_of::<usize>()] = transmute::<i64, _>(read);
-            buf[buf_offset] = BREAKPOINT_TRAP_X86;
+            let mut buf: [u8; std::mem::size_of::<usize>()] = transmute::<isize, _>(read as isize);
+            buf[buf_offset] = TRAP_X86;
             write(
                 pid,
                 aligned_addr as *const u64 as *mut c_void,
@@ -183,34 +183,38 @@ fn set_branch_breakpoints(
         }
     }
 
-    // doesn't work because process_vm_writev cannot write to write-protected pages
-    // and ptrace does bypass read only permission protections, see:
-    // https://stackoverflow.com/questions/49442087/how-does-ptrace-poketext-works-when-modifying-program-text
-    //    let mut local_iov = Vec::<IoVec<&[u8]>>::with_capacity(branching_insns.len());
-    //    let mut remote_iov = Vec::<RemoteIoVec>::with_capacity(branching_insns.len());
-    //    for (addr, entry) in branching_insns.iter() {
-    //        local_iov.push(IoVec::from_slice(&entry.orig_byte));
-    //        remote_iov.push(RemoteIoVec {
-    //            base: *addr as usize,
-    //            len: 1,
-    //        });
-    //    }
-    //    trace!(
-    //        "Replacing {} instructions in tracee's memory",
-    //        branching_insns.len()
-    //    );
-    //    let bytes_written = process_vm_writev(pid, local_iov.as_slice(), remote_iov.as_slice())?;
-    //    trace!("Written {} bytes to the tracee's memory", bytes_written);
-    //    if bytes_written != branching_insns.len() {
-    //        warn!(
-    //            "process_vm_writev bytes written return value does not match expected value, continuing"
-    //        );
-    //    }
-
     Ok(())
 }
 
-fn trace(_pid: Pid) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_trap(
+    pid: Pid,
+    jump_addresses: &JumpAddresses,
+    code_regions: &CodeRegions,
+) -> Result<Pid, Box<dyn std::error::Error>> {
+    // TODO get current IP
+
+    // TODO check if SIGTRAP is one of our traps
+
+    // TODO replace instruction/byte with the original one
+
+    // TODO back IP by one byte
+
+    // TODO step one instruction for this particular PID/child
+
+    // TODO place trap back into the same place
+
+    // TODO check if branch was taken or not - or alternatively just save the IP after stepping
+
+    // TODO save results to branch log structure
+
+    Ok(pid)
+}
+
+fn trace(
+    _pid: Pid,
+    jump_addresses: &JumpAddresses,
+    code_regions: &CodeRegions,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut traced_processes = 1;
     loop {
         trace!("Tracer waiting");
@@ -260,6 +264,8 @@ fn trace(_pid: Pid) -> Result<(), Box<dyn std::error::Error>> {
                 debug!("Stopped: pid {}, signal {}", pid, signal);
                 match signal {
                     SIGSTOP => Some(pid),
+                    SIGTRAP => Some(handle_trap(pid, jump_addresses, code_regions)?),
+                    // TODO handle every signal properly
                     _ => None,
                 }
             }
@@ -321,10 +327,10 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // TODO handle case with code being loaded dynamically in runtime (plugins)
     let code_regions = get_code_regions(child_pid)?;
-    let mut branching_insns = find_jumps(&code_regions)?;
-    set_branch_breakpoints(child_pid, &mut branching_insns)?;
+    let jump_addresses = find_jumps(&code_regions)?;
+    set_branch_breakpoints(child_pid, &jump_addresses)?;
 
-    trace(child_pid)
+    trace(child_pid, &jump_addresses, &code_regions)
 }
 
 #[cfg(target_os = "linux")]
