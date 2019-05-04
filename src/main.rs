@@ -1,17 +1,20 @@
 use core::borrow::Borrow;
 use std::error::Error;
+use std::fs::read_to_string;
 use std::io::Error as IoError;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 use capstone::prelude::*;
 use clap;
+use fasthash::xx::Hash64;
 use log::{debug, error, info, trace, warn};
 use nix::sys::ptrace::{attach, cont, setoptions, traceme, Event, Options};
 use nix::sys::uio::{process_vm_readv, IoVec, RemoteIoVec};
 use nix::sys::wait::{wait, WaitStatus};
 use nix::unistd::Pid;
 use proc_maps::{get_process_maps, MapRange};
+use std::collections::HashMap;
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
@@ -94,28 +97,45 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let ptrace_options = ptrace_options;
 
     setoptions(child_pid, ptrace_options)?;
+    trace!("Set tracing options for the tracee PID {}", child_pid);
 
     // TODO handle case with code being loaded dynamically in runtime (plugins)
-    get_code_regions(child_pid, &args.command[0])?;
-    analyze_code()?;
-    set_branch_breakpoints(child_pid, &args.command[0])?;
+    let code_regions = get_code_regions(child_pid)?;
+    find_jumps(code_regions)?;
+    set_branch_breakpoints(child_pid)?;
 
     trace(child_pid)
 }
 
-fn get_code_regions(
-    pid: Pid,
-    command: &str,
-) -> Result<Vec<(MapRange, Vec<u8>)>, Box<dyn std::error::Error>> {
+fn get_code_regions(pid: Pid) -> Result<Vec<(MapRange, Vec<u8>)>, Box<dyn std::error::Error>> {
     let maps = get_process_maps(pid.as_raw())?;
+    trace!("Read tracee PID {} memory maps from procfs", pid);
+    let original_cmdline = read_to_string(format!("/proc/{}/cmdline", pid))?;
+    let original_cmd = original_cmdline.split('\0').next().unwrap_or("");
+    trace!(
+        "Retrieved \"{}\" as the tracee PID {} original first command line argument",
+        original_cmd,
+        pid
+    );
     let mut code_maps_with_buffers: Vec<_> = maps
         .into_iter()
         .filter(|map| {
-            return map
-                .filename()
-                .as_ref()
-                .filter(|name| name.ends_with(command))
-                .is_some();
+            trace!(
+                "PID {}:\t{:x}-{:x}\t{}\t{:x}\t{}\t{}\t\t{}",
+                pid,
+                map.start(),
+                map.start() + map.size(),
+                map.flags,
+                map.offset,
+                map.dev,
+                map.inode,
+                map.filename().as_ref().map_or("", |s| &**s)
+            );
+            map.is_exec()
+                && map
+                    .filename()
+                    .as_ref()
+                    .map_or(false, |name| name.ends_with(original_cmd))
         })
         .map(|map| {
             let mut buf = Vec::<u8>::with_capacity(map.size());
@@ -123,6 +143,10 @@ fn get_code_regions(
             (map, buf)
         })
         .collect();
+    trace!(
+        "Allocated {} buffers for tracee's memory regions",
+        code_maps_with_buffers.len()
+    );
 
     let mut local_iov = Vec::<IoVec<&mut [u8]>>::with_capacity(code_maps_with_buffers.len());
     let mut remote_iov = Vec::<RemoteIoVec>::with_capacity(code_maps_with_buffers.len());
@@ -133,8 +157,9 @@ fn get_code_regions(
             len: map.size(),
         })
     }
-    let bytes_written = process_vm_readv(pid, local_iov.as_slice(), remote_iov.as_slice())?;
-    if bytes_written != code_maps_with_buffers.iter().map(|(m, b)| m.size()).sum() {
+    let bytes_read = process_vm_readv(pid, local_iov.as_slice(), remote_iov.as_slice())?;
+    trace!("Read {} bytes of the tracee's memory", bytes_read);
+    if bytes_read != code_maps_with_buffers.iter().map(|(m, b)| m.size()).sum() {
         warn!(
             "process_vm_readv bytes written return value does not match expected value, continuing"
         );
@@ -143,7 +168,25 @@ fn get_code_regions(
     Ok(code_maps_with_buffers)
 }
 
-fn analyze_code() -> Result<(), Box<dyn std::error::Error>> {
+//    for i in 0..255 {
+//        println!(
+//            "{}: {}",
+//            i,
+//            cs_x86.group_name(InsnGroupId(i)).unwrap_or("?".to_string())
+//        );
+//    }
+const JUMP_GROUP: u8 = 1;
+const BRANCH_RELATIVE_GROUP: u8 = 7;
+
+struct BranchEntry {
+    orig_ins: Vec<u8>,
+}
+
+const INITIAL_BRANCH_MAP_CAPACITY: usize = 4096;
+const MAX_INSTRUCTION_SIZE: usize = 16;
+
+fn find_jumps(code_regions: Vec<(MapRange, Vec<u8>)>) -> Result<(), Box<dyn std::error::Error>> {
+    // TODO 32-bit mode?
     let cs_x86 = Capstone::new()
         .x86()
         .mode(arch::x86::ArchMode::Mode64)
@@ -151,12 +194,39 @@ fn analyze_code() -> Result<(), Box<dyn std::error::Error>> {
         .detail(true)
         .build()?;
 
+    let mut branching_insns =
+        HashMap::with_capacity_and_hasher(INITIAL_BRANCH_MAP_CAPACITY, Hash64);
+
+    for (map, buf) in code_regions.iter() {
+        let insns = cs_x86.disasm_all(buf.as_slice(), map.start() as u64)?;
+        for ins in insns.iter() {
+            if let Ok(detail) = cs_x86.insn_detail(&ins) {
+                if detail
+                    .groups()
+                    .filter(|g| g.0 == JUMP_GROUP || g.0 == BRANCH_RELATIVE_GROUP)
+                    .count()
+                    == 2
+                {
+                    trace!("Instruction detected for trap tracing: {} ", ins);
+                    let mut ins_bytes = Vec::with_capacity(MAX_INSTRUCTION_SIZE);
+                    ins_bytes.extend_from_slice(ins.bytes());
+                    let inserted = branching_insns.insert(
+                        ins.address(),
+                        BranchEntry {
+                            orig_ins: ins_bytes,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
     // TODO create a map with addresses as keys and instruction as values
 
     Ok(())
 }
 
-fn set_branch_breakpoints(pid: Pid, command: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn set_branch_breakpoints(pid: Pid) -> Result<(), Box<dyn std::error::Error>> {
     // TODO and replace those instructions with one-byte trap syscalls
 
     Ok(())
