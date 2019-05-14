@@ -1,21 +1,26 @@
 use core::borrow::Borrow;
 use std::error::Error;
+use std::ffi::c_void;
 use std::fs::read_to_string;
 use std::io::Error as IoError;
 use std::mem::transmute;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::{mem, ptr};
 
 use capstone::prelude::*;
 use clap;
+use libc;
 use log::{debug, error, info, trace, warn};
-use nix::sys::ptrace::{attach, cont, read, setoptions, traceme, write, Event, Options};
+use nix::errno::Errno;
+use nix::sys::ptrace::{
+    attach, cont, read, setoptions, step, traceme, write, Event, Options, Request, RequestType,
+};
 use nix::sys::signal::{SIGSTOP, SIGTRAP};
 use nix::sys::uio::{process_vm_readv, IoVec, RemoteIoVec};
-use nix::sys::wait::{wait, WaitStatus};
+use nix::sys::wait::{wait, waitpid, WaitStatus};
 use nix::unistd::Pid;
 use proc_maps::{get_process_maps, MapRange};
-use std::ffi::c_void;
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
@@ -48,15 +53,16 @@ fn int_to_ptrace_event(value: i32) -> Option<Event> {
     }
 }
 
-type CodeRegions = Vec<(MapRange, Vec<u8>)>;
+type MemoryRegion = (MapRange, Vec<u8>);
+type MemoryRegions = Vec<MemoryRegion>;
 
-fn get_code_regions(pid: Pid) -> Result<CodeRegions, Box<dyn std::error::Error>> {
+fn get_code_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Error>> {
     let maps = get_process_maps(pid.as_raw())?;
-    trace!("Read tracee PID {} memory maps from procfs", pid);
+    trace!("Read tracee {} memory maps from procfs", pid);
     let original_cmdline = read_to_string(format!("/proc/{}/cmdline", pid))?;
     let original_cmd = original_cmdline.split('\0').next().unwrap_or("");
     trace!(
-        "Retrieved \"{}\" as the tracee PID {} original first command line argument",
+        "Retrieved \"{}\" as the tracee {}'s original first command line argument",
         original_cmd,
         pid
     );
@@ -64,7 +70,7 @@ fn get_code_regions(pid: Pid) -> Result<CodeRegions, Box<dyn std::error::Error>>
         .into_iter()
         .filter(|map| {
             trace!(
-                "PID {}:\t{:x}-{:x}\t{}\t{:x}\t{}\t{}\t\t{}",
+                "tracee {}:\t{:x}-{:x}\t{}\t{:x}\t{}\t{}\t\t{}",
                 pid,
                 map.start(),
                 map.start() + map.size(),
@@ -87,10 +93,10 @@ fn get_code_regions(pid: Pid) -> Result<CodeRegions, Box<dyn std::error::Error>>
         })
         .collect();
     trace!(
-        "Allocated {} buffers for tracee's memory regions",
-        code_maps_with_buffers.len()
+        "Allocated {} buffers for tracee {}'s memory regions",
+        code_maps_with_buffers.len(),
+        pid
     );
-
     let mut local_iov = Vec::<IoVec<&mut [u8]>>::with_capacity(code_maps_with_buffers.len());
     let mut remote_iov = Vec::<RemoteIoVec>::with_capacity(code_maps_with_buffers.len());
     for (map, buf) in code_maps_with_buffers.iter_mut() {
@@ -101,18 +107,19 @@ fn get_code_regions(pid: Pid) -> Result<CodeRegions, Box<dyn std::error::Error>>
         })
     }
     let bytes_read = process_vm_readv(pid, local_iov.as_slice(), remote_iov.as_slice())?;
-    trace!("Read {} bytes of the tracee's memory", bytes_read);
+    trace!("Read {} bytes of the tracee {}'s memory", bytes_read, pid);
     if bytes_read != code_maps_with_buffers.iter().map(|(m, _b)| m.size()).sum() {
         warn!("process_vm_readv bytes read return value does not match expected value, continuing");
+        debug_assert!(false);
     }
-
     Ok(code_maps_with_buffers)
 }
 
 const INITIAL_JUMP_VEC_CAPACITY: usize = 4096;
+
 type JumpAddresses = Vec<(usize, u8)>;
 
-fn find_jumps(code_regions: &CodeRegions) -> Result<JumpAddresses, Box<dyn std::error::Error>> {
+fn find_jumps(code_regions: &MemoryRegions) -> Result<JumpAddresses, Box<dyn std::error::Error>> {
     const JUMP_GROUP: u8 = 1;
     const BRANCH_RELATIVE_GROUP: u8 = 7;
 
@@ -124,11 +131,12 @@ fn find_jumps(code_regions: &CodeRegions) -> Result<JumpAddresses, Box<dyn std::
         .detail(true)
         .build()?;
     trace!("Created capstone object");
-
     let mut jump_addresses = Vec::with_capacity(INITIAL_JUMP_VEC_CAPACITY);
-    trace!("Allocated Vec for found branch instructions");
-
-    for (map, buf) in code_regions.iter() {
+    trace!(
+        "Created Vec for jump addresses with {} initial capacity",
+        jump_addresses.capacity()
+    );
+    for (map, buf) in code_regions {
         let insns = cs_x86.disasm_all(buf.as_slice(), map.start() as u64)?;
         for ins in insns.iter() {
             if let Ok(detail) = cs_x86.insn_detail(&ins) {
@@ -145,19 +153,108 @@ fn find_jumps(code_regions: &CodeRegions) -> Result<JumpAddresses, Box<dyn std::
         }
     }
     let jumps_before_dedup = jump_addresses.len();
-    jump_addresses.sort_by(|a, b| a.0.cmp(&b.0));
-    jump_addresses.dedup_by(|a, b| a.0 == b.0);
+    jump_addresses.sort_by_key(|s| s.0);
+    jump_addresses.dedup_by_key(|s| s.0);
     debug_assert_eq!(
         jump_addresses.len(),
         jumps_before_dedup,
         "Same instruction was presented twice"
     );
     trace!(
-        "Allocated Vec for branch instructions has {} entries",
-        jump_addresses.len()
+        "Vec for branch instructions info has {}/{} entries",
+        jump_addresses.len(),
+        jump_addresses.capacity()
     );
-
     Ok(jump_addresses)
+}
+
+fn tracee_set_byte(pid: Pid, addr: usize, byte: u8) -> Result<(), Box<dyn std::error::Error>> {
+    let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
+    let buf_offset = addr - aligned_addr;
+    unsafe {
+        let read = read(pid, aligned_addr as *const u64 as *mut c_void)?;
+        let mut buf: [u8; std::mem::size_of::<usize>()] = transmute::<isize, _>(read as isize);
+        buf[buf_offset] = byte;
+        write(
+            pid,
+            aligned_addr as *const u64 as *mut c_void,
+            &buf[0] as *const u8 as *mut c_void,
+        )?;
+    }
+    Ok(())
+}
+
+// TODO remove this when nix/libc starts supporting setregs/getregs for musl targets
+struct Registers {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rax: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub orig_rax: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub eflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+    pub fs_base: u64,
+    pub gs_base: u64,
+    pub ds: u64,
+    pub es: u64,
+    pub fs: u64,
+    pub gs: u64,
+}
+
+fn tracee_set_registers(pid: Pid, regs: &Registers) -> Result<(), Box<dyn std::error::Error>> {
+    let res = unsafe {
+        libc::ptrace(
+            Request::PTRACE_SETREGS as RequestType,
+            libc::pid_t::from(pid),
+            ptr::null_mut::<c_void>(),
+            &regs as *const _ as *const c_void,
+        )
+    };
+    Errno::result(res)
+        .map(drop)
+        .map_err(|x| Box::new(x) as Box<dyn std::error::Error>)
+}
+
+fn tracee_get_registers(pid: Pid) -> Result<Registers, Box<dyn std::error::Error>> {
+    let regs: Registers = unsafe { mem::uninitialized() };
+    let res = unsafe {
+        libc::ptrace(
+            Request::PTRACE_GETREGS as RequestType,
+            libc::pid_t::from(pid),
+            ptr::null_mut::<Registers>(),
+            &regs as *const _ as *const c_void,
+        )
+    };
+    Errno::result(res)?;
+    Ok(regs)
+}
+
+fn tracee_save_registers(pid: Pid, regs: &mut Registers) -> Result<(), Box<dyn std::error::Error>> {
+    let res = unsafe {
+        libc::ptrace(
+            Request::PTRACE_GETREGS as RequestType,
+            libc::pid_t::from(pid),
+            ptr::null_mut::<Registers>(),
+            &regs as *const _ as *const c_void,
+        )
+    };
+    Errno::result(res)
+        .map(drop)
+        .map_err(|x| Box::new(x) as Box<dyn std::error::Error>)
 }
 
 const TRAP_X86: u8 = 0xCC;
@@ -166,54 +263,79 @@ fn set_branch_breakpoints(
     pid: Pid,
     jump_addresses: &JumpAddresses,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for (addr, _len) in jump_addresses.iter() {
-        trace!("Replacing instruction at {:x} in tracee's memory", addr);
-        let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
-        let buf_offset = addr - aligned_addr;
+    for (addr, _len) in jump_addresses {
+        trace!(
+            "Setting a trap instruction at {:x} in tracee {}'s memory",
+            addr,
+            pid
+        );
+        tracee_set_byte(pid, *addr, TRAP_X86)?;
+    }
+    Ok(())
+}
 
-        unsafe {
-            let read = read(pid, aligned_addr as *const u64 as *mut c_void)?;
-            let mut buf: [u8; std::mem::size_of::<usize>()] = transmute::<isize, _>(read as isize);
-            buf[buf_offset] = TRAP_X86;
-            write(
-                pid,
-                aligned_addr as *const u64 as *mut c_void,
-                &buf[0] as *const u8 as *mut c_void,
-            )?;
+fn region_for_address(addr: usize, code_regions: &MemoryRegions) -> Option<&MemoryRegion> {
+    for region in code_regions {
+        if addr > region.0.start() && addr < region.0.start() + region.0.size() {
+            return Some(region);
         }
     }
-
-    Ok(())
+    None
 }
 
 fn handle_trap(
     pid: Pid,
     jump_addresses: &JumpAddresses,
-    code_regions: &CodeRegions,
+    code_regions: &MemoryRegions,
 ) -> Result<Pid, Box<dyn std::error::Error>> {
-    // TODO get current IP
-
-    // TODO check if SIGTRAP is one of our traps
-
-    // TODO replace instruction/byte with the original one
-
-    // TODO back IP by one byte
-
-    // TODO step one instruction for this particular PID/child
-
-    // TODO place trap back into the same place
-
-    // TODO check if branch was taken or not - or alternatively just save the IP after stepping
-
-    // TODO save results to branch log structure
-
+    trace!("Reading tracee {}'s registers", pid);
+    let mut regs = tracee_get_registers(pid)?;
+    let trap_addr = regs.rip as usize;
+    if let Ok(_) = jump_addresses.binary_search_by_key(&trap_addr, |s| s.0) {
+        let region = region_for_address(trap_addr, code_regions).unwrap();
+        let region_offset = trap_addr - region.0.start();
+        trace!(
+            "Removing a trap at {:x} in tracee {}'s memory",
+            trap_addr,
+            pid
+        );
+        tracee_set_byte(pid, trap_addr, region.1[region_offset])?;
+        regs.rip -= 1;
+        trace!("Writing tracee {}'s registers (RIP -= 1)", pid);
+        tracee_set_registers(pid, &regs)?;
+        trace!("Stepping tracee {}", pid);
+        step(pid, None)?;
+        trace!("Waiting for tracee {}", pid);
+        let wait_result = waitpid(pid, None)?;
+        if let WaitStatus::Continued(_pid) = wait_result {
+            trace!(
+                "Setting a trap instruction at {:x} in tracee {}'s memory",
+                trap_addr,
+                pid
+            );
+            tracee_set_byte(pid, trap_addr, TRAP_X86)?;
+            trace!("Reading tracee {}'s registers", pid);
+            tracee_save_registers(pid, &mut regs)?;
+        // TODO check if branch was taken or not
+        // TODO or alternatively just save the IP after stepping
+        // TODO save results to branch log structure
+        } else {
+            // TODO do something reasonable, e.g. get a life
+            panic!("we ran out of coffee");
+        }
+    } else {
+        warn!(
+            "Tracee SIGTRAP not caused by the tracer, RIP={:x}",
+            trap_addr
+        );
+    }
     Ok(pid)
 }
 
 fn trace(
     _pid: Pid,
     jump_addresses: &JumpAddresses,
-    code_regions: &CodeRegions,
+    code_regions: &MemoryRegions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut traced_processes = 1;
     loop {
@@ -226,7 +348,6 @@ fn trace(
             }
             WaitStatus::Exited(pid, ret) => {
                 debug!("Exited: pid {}, ret {}", pid, ret);
-
                 traced_processes -= 1;
                 if traced_processes == 0 {
                     trace!("Last tracee exited, exiting");
@@ -280,13 +401,11 @@ fn trace(
 fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let child_pid: Pid;
     let mut ptrace_options = Options::empty();
-
     if args.follow {
         ptrace_options |= Options::PTRACE_O_TRACEFORK
             | Options::PTRACE_O_TRACEVFORK
             | Options::PTRACE_O_TRACECLONE;
     }
-
     if let Some(pid) = args.pid {
         // TODO support attaching to PID + all its current children with a flag?
         child_pid = Pid::from_raw(pid as i32);
@@ -303,16 +422,12 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(_) = traceme() {
                         return Err(IoError::last_os_error());
                     }
-                    //                    trace!("Child process raising SIGSTOP");
-                    //                    if let Err(_) = raise(Signal::SIGSTOP) {
-                    //                        return Err(IoError::last_os_error());
-                    //                    }
                     Ok(())
                 })
                 .spawn()?;
             child_pid = Pid::from_raw(child.id() as i32);
         }
-        info!("Running {} attached in {}", args.command[0], child_pid);
+        info!("Running {} attached in PID {}", args.command[0], child_pid);
     } else {
         // TODO implement this with structopt and panic here instead
         return Err(Box::new(clap::Error::with_description(
@@ -321,24 +436,19 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
         )));
     }
     let ptrace_options = ptrace_options;
-
     setoptions(child_pid, ptrace_options)?;
-    trace!("Set tracing options for the tracee PID {}", child_pid);
-
+    trace!("Set tracing options for tracee {}", child_pid);
     // TODO handle case with code being loaded dynamically in runtime (plugins)
     let code_regions = get_code_regions(child_pid)?;
     let jump_addresses = find_jumps(&code_regions)?;
     set_branch_breakpoints(child_pid, &jump_addresses)?;
-
     trace(child_pid, &jump_addresses, &code_regions)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 fn main() {
     env_logger::init();
-
     let args = Cli::from_args();
-
     if let Err(top_e) = run(args) {
         error!("{}", top_e.to_string());
         let mut e: &Error = top_e.borrow();
