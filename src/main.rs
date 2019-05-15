@@ -3,7 +3,6 @@ use std::error::Error;
 use std::ffi::c_void;
 use std::fs::read_to_string;
 use std::io::Error as IoError;
-use std::mem::transmute;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::{mem, ptr};
@@ -21,6 +20,7 @@ use nix::sys::uio::{process_vm_readv, IoVec, RemoteIoVec};
 use nix::sys::wait::{wait, waitpid, WaitStatus};
 use nix::unistd::Pid;
 use proc_maps::{get_process_maps, MapRange};
+use std::mem::transmute;
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
@@ -58,13 +58,12 @@ type MemoryRegions = Vec<MemoryRegion>;
 
 fn get_code_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Error>> {
     let maps = get_process_maps(pid.as_raw())?;
-    trace!("Read tracee {} memory maps from procfs", pid);
+    debug!("Read tracee {} memory maps from procfs", pid);
     let original_cmdline = read_to_string(format!("/proc/{}/cmdline", pid))?;
     let original_cmd = original_cmdline.split('\0').next().unwrap_or("");
-    trace!(
+    debug!(
         "Retrieved \"{}\" as the tracee {}'s original first command line argument",
-        original_cmd,
-        pid
+        original_cmd, pid
     );
     let mut code_maps_with_buffers: Vec<_> = maps
         .into_iter()
@@ -92,7 +91,7 @@ fn get_code_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Error
             (map, buf)
         })
         .collect();
-    trace!(
+    debug!(
         "Allocated {} buffers for tracee {}'s memory regions",
         code_maps_with_buffers.len(),
         pid
@@ -107,7 +106,7 @@ fn get_code_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Error
         })
     }
     let bytes_read = process_vm_readv(pid, local_iov.as_slice(), remote_iov.as_slice())?;
-    trace!("Read {} bytes of the tracee {}'s memory", bytes_read, pid);
+    debug!("Read {} bytes of the tracee {}'s memory", bytes_read, pid);
     if bytes_read != code_maps_with_buffers.iter().map(|(m, _b)| m.size()).sum() {
         warn!("process_vm_readv bytes read return value does not match expected value, continuing");
         debug_assert!(false);
@@ -160,7 +159,7 @@ fn find_jumps(code_regions: &MemoryRegions) -> Result<JumpAddresses, Box<dyn std
         jumps_before_dedup,
         "Same instruction was presented twice"
     );
-    trace!(
+    debug!(
         "Vec for branch instructions info has {}/{} entries",
         jump_addresses.len(),
         jump_addresses.capacity()
@@ -170,18 +169,39 @@ fn find_jumps(code_regions: &MemoryRegions) -> Result<JumpAddresses, Box<dyn std
 
 fn tracee_set_byte(pid: Pid, addr: usize, byte: u8) -> Result<(), Box<dyn std::error::Error>> {
     let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
+    debug_assert_eq!(
+        aligned_addr + addr % std::mem::size_of::<usize>(),
+        addr,
+        "Address alignment computed incorrectly"
+    );
     let buf_offset = addr - aligned_addr;
-    unsafe {
-        let read = read(pid, aligned_addr as *const u64 as *mut c_void)?;
-        let mut buf: [u8; std::mem::size_of::<usize>()] = transmute::<isize, _>(read as isize);
-        buf[buf_offset] = byte;
-        write(
-            pid,
-            aligned_addr as *const u64 as *mut c_void,
-            &buf[0] as *const u8 as *mut c_void,
-        )?;
-    }
+    let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
+    let mut buf = read_word.to_ne_bytes();
+    buf[buf_offset] = byte;
+    let write_word = unsafe { transmute::<_, usize>(buf) };
+    trace!(
+        "Overwriting word at address {:x}: {:x} with {:x}",
+        aligned_addr,
+        read_word,
+        write_word
+    );
+    // This is tricky - although ptrace's signature says "void *data"
+    // POKEDATA accepts the word to write by value
+    write(pid, aligned_addr as *mut c_void, write_word as *mut c_void)?;
+    debug_assert_eq!(
+        read(pid, aligned_addr as *mut c_void)?.to_ne_bytes(),
+        buf,
+        "Read value is not equal to the written value"
+    );
     Ok(())
+}
+
+fn tracee_get_byte(pid: Pid, addr: usize) -> Result<u8, Box<dyn std::error::Error>> {
+    let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
+    let buf_offset = addr - aligned_addr;
+    let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
+    trace!("Read word at address {:x}: {:x}", aligned_addr, read_word);
+    Ok(read_word.to_ne_bytes()[buf_offset])
 }
 
 // TODO remove this when nix/libc starts supporting setregs/getregs for musl targets

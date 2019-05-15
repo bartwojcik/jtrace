@@ -5,11 +5,11 @@ authors = ["Bartosz Wojcik <bartwojc@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-libc = "0.2.54"
 capstone = "0.6.0"
 clap = "2.33.0"
 env_logger = "0.6.1"
 exitfailure = "0.5.1"
+libc = "0.2.54"
 log = "0.4.6"
 nix = "0.13.0"
 proc-maps = "0.1.5"
