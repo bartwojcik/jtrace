@@ -20,6 +20,7 @@ use nix::sys::uio::{process_vm_readv, IoVec, RemoteIoVec};
 use nix::sys::wait::{wait, waitpid, WaitStatus};
 use nix::unistd::Pid;
 use proc_maps::{get_process_maps, MapRange};
+use std::collections::vec_deque::VecDeque;
 use std::mem::transmute;
 use structopt::StructOpt;
 
@@ -136,17 +137,26 @@ fn find_jumps(code_regions: &MemoryRegions) -> Result<JumpAddresses, Box<dyn std
         jump_addresses.capacity()
     );
     for (map, buf) in code_regions {
-        let insns = cs_x86.disasm_all(buf.as_slice(), map.start() as u64)?;
-        for ins in insns.iter() {
-            if let Ok(detail) = cs_x86.insn_detail(&ins) {
-                if detail
-                    .groups()
-                    .filter(|g| g.0 == JUMP_GROUP || g.0 == BRANCH_RELATIVE_GROUP)
-                    .count()
-                    == 2
-                {
-                    trace!("Instruction detected for trap tracing: {} ", ins);
-                    jump_addresses.push((ins.address() as usize, ins.bytes().len() as u8));
+        let mut pos = 0;
+        // capstone iteration stops on invalid bytes, so loop is needed here
+        while pos < map.size() {
+            let insns = cs_x86.disasm_all(&buf[pos..], (map.start() + pos) as u64)?;
+            if insns.is_empty() {
+                pos += 1;
+            } else {
+                for ins in insns.iter() {
+                    if let Ok(detail) = cs_x86.insn_detail(&ins) {
+                        if detail
+                            .groups()
+                            .filter(|g| g.0 == JUMP_GROUP || g.0 == BRANCH_RELATIVE_GROUP)
+                            .count()
+                            == 2
+                        {
+                            debug!("Instruction detected for trap tracing: {} ", ins);
+                            jump_addresses.push((ins.address() as usize, ins.bytes().len() as u8));
+                        }
+                    }
+                    pos += ins.bytes().len();
                 }
             }
         }
@@ -205,6 +215,7 @@ fn tracee_get_byte(pid: Pid, addr: usize) -> Result<u8, Box<dyn std::error::Erro
 }
 
 // TODO remove this when nix/libc starts supporting setregs/getregs for musl targets
+#[repr(C)]
 struct Registers {
     pub r15: u64,
     pub r14: u64,
@@ -236,12 +247,13 @@ struct Registers {
 }
 
 fn tracee_set_registers(pid: Pid, regs: &Registers) -> Result<(), Box<dyn std::error::Error>> {
+    trace!("Writing tracee {}'s registers", pid);
     let res = unsafe {
         libc::ptrace(
             Request::PTRACE_SETREGS as RequestType,
             libc::pid_t::from(pid),
             ptr::null_mut::<c_void>(),
-            &regs as *const _ as *const c_void,
+            regs as *const _ as *const c_void,
         )
     };
     Errno::result(res)
@@ -250,6 +262,7 @@ fn tracee_set_registers(pid: Pid, regs: &Registers) -> Result<(), Box<dyn std::e
 }
 
 fn tracee_get_registers(pid: Pid) -> Result<Registers, Box<dyn std::error::Error>> {
+    trace!("Reading tracee {}'s registers", pid);
     let regs: Registers = unsafe { mem::uninitialized() };
     let res = unsafe {
         libc::ptrace(
@@ -264,12 +277,13 @@ fn tracee_get_registers(pid: Pid) -> Result<Registers, Box<dyn std::error::Error
 }
 
 fn tracee_save_registers(pid: Pid, regs: &mut Registers) -> Result<(), Box<dyn std::error::Error>> {
+    trace!("Reading tracee {}'s registers", pid);
     let res = unsafe {
         libc::ptrace(
             Request::PTRACE_GETREGS as RequestType,
             libc::pid_t::from(pid),
             ptr::null_mut::<Registers>(),
-            &regs as *const _ as *const c_void,
+            regs as *const _ as *const c_void,
         )
     };
     Errno::result(res)
@@ -303,15 +317,19 @@ fn region_for_address(addr: usize, code_regions: &MemoryRegions) -> Option<&Memo
     None
 }
 
+// TODO this should be more sophisticated
+type ExecutionPathEntry = (Pid, usize, bool);
+type ExecutionPathLog = VecDeque<ExecutionPathEntry>;
+
 fn handle_trap(
     pid: Pid,
     jump_addresses: &JumpAddresses,
     code_regions: &MemoryRegions,
+    execution_log: &mut ExecutionPathLog,
 ) -> Result<Pid, Box<dyn std::error::Error>> {
-    trace!("Reading tracee {}'s registers", pid);
     let mut regs = tracee_get_registers(pid)?;
-    let trap_addr = regs.rip as usize;
-    if let Ok(_) = jump_addresses.binary_search_by_key(&trap_addr, |s| s.0) {
+    let trap_addr = (regs.rip - 1) as usize;
+    if let Ok(orig_instr_loc) = jump_addresses.binary_search_by_key(&trap_addr, |s| s.0) {
         let region = region_for_address(trap_addr, code_regions).unwrap();
         let region_offset = trap_addr - region.0.start();
         trace!(
@@ -321,32 +339,38 @@ fn handle_trap(
         );
         tracee_set_byte(pid, trap_addr, region.1[region_offset])?;
         regs.rip -= 1;
-        trace!("Writing tracee {}'s registers (RIP -= 1)", pid);
         tracee_set_registers(pid, &regs)?;
         trace!("Stepping tracee {}", pid);
         step(pid, None)?;
-        trace!("Waiting for tracee {}", pid);
         let wait_result = waitpid(pid, None)?;
-        if let WaitStatus::Continued(_pid) = wait_result {
+        if let WaitStatus::Stopped(_pid, SIGTRAP) = wait_result {
+            debug_assert_eq!(pid, _pid);
             trace!(
                 "Setting a trap instruction at {:x} in tracee {}'s memory",
                 trap_addr,
                 pid
             );
             tracee_set_byte(pid, trap_addr, TRAP_X86)?;
-            trace!("Reading tracee {}'s registers", pid);
             tracee_save_registers(pid, &mut regs)?;
-        // TODO check if branch was taken or not
-        // TODO or alternatively just save the IP after stepping
-        // TODO save results to branch log structure
+            let orig_instr_size = jump_addresses[orig_instr_loc].1;
+            if regs.rip as usize == trap_addr + orig_instr_size as usize {
+                execution_log.push_back((pid, trap_addr, false));
+                trace!("Branch at {:x} not taken by {}!", trap_addr, pid);
+            } else {
+                execution_log.push_back((pid, trap_addr, true));
+                trace!("Branch at {:x} taken by {}!", trap_addr, pid);
+            }
         } else {
-            // TODO do something reasonable, e.g. get a life
-            panic!("we ran out of coffee");
+            warn!(
+                "Continuing after not getting the expected SIGTRAP after stepping: {:?}",
+                wait_result
+            );
+            debug_assert!(false);
         }
     } else {
         warn!(
             "Tracee SIGTRAP not caused by the tracer, RIP={:x}",
-            trap_addr
+            regs.rip as usize
         );
     }
     Ok(pid)
@@ -356,6 +380,7 @@ fn trace(
     _pid: Pid,
     jump_addresses: &JumpAddresses,
     code_regions: &MemoryRegions,
+    execution_log: &mut ExecutionPathLog,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut traced_processes = 1;
     loop {
@@ -405,7 +430,12 @@ fn trace(
                 debug!("Stopped: pid {}, signal {}", pid, signal);
                 match signal {
                     SIGSTOP => Some(pid),
-                    SIGTRAP => Some(handle_trap(pid, jump_addresses, code_regions)?),
+                    SIGTRAP => Some(handle_trap(
+                        pid,
+                        jump_addresses,
+                        code_regions,
+                        execution_log,
+                    )?),
                     // TODO handle every signal properly
                     _ => None,
                 }
@@ -417,6 +447,8 @@ fn trace(
         }
     }
 }
+
+const INITIAL_EXECUTION_LOG_CAPACITY: usize = 134217728;
 
 fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let child_pid: Pid;
@@ -462,7 +494,13 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let code_regions = get_code_regions(child_pid)?;
     let jump_addresses = find_jumps(&code_regions)?;
     set_branch_breakpoints(child_pid, &jump_addresses)?;
-    trace(child_pid, &jump_addresses, &code_regions)
+    let mut execution_log = ExecutionPathLog::with_capacity(INITIAL_EXECUTION_LOG_CAPACITY);
+    trace(
+        child_pid,
+        &jump_addresses,
+        &code_regions,
+        &mut execution_log,
+    )
 }
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
