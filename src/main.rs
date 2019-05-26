@@ -15,7 +15,7 @@ use nix::errno::Errno;
 use nix::sys::ptrace::{
     attach, cont, read, setoptions, step, traceme, write, Event, Options, Request, RequestType,
 };
-use nix::sys::signal::{SIGSTOP, SIGTRAP};
+use nix::sys::signal::{SIGCHLD, SIGSTOP, SIGTRAP};
 use nix::sys::uio::{process_vm_readv, IoVec, RemoteIoVec};
 use nix::sys::wait::{wait, waitpid, WaitStatus};
 use nix::unistd::Pid;
@@ -70,7 +70,7 @@ fn get_code_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Error
         .into_iter()
         .filter(|map| {
             trace!(
-                "tracee {}:\t{:x}-{:x}\t{}\t{:x}\t{}\t{}\t\t{}",
+                "tracee {}:\t{:#x}-{:#x}\t{}\t{:x}\t{}\t{}\t\t{}",
                 pid,
                 map.start(),
                 map.start() + map.size(),
@@ -190,7 +190,7 @@ fn tracee_set_byte(pid: Pid, addr: usize, byte: u8) -> Result<(), Box<dyn std::e
     buf[buf_offset] = byte;
     let write_word = unsafe { transmute::<_, usize>(buf) };
     trace!(
-        "Overwriting word at address {:x}: {:x} with {:x}",
+        "Overwriting word at address {:#x}: {:#018x} with {:#018x}",
         aligned_addr,
         read_word,
         write_word
@@ -210,7 +210,11 @@ fn tracee_get_byte(pid: Pid, addr: usize) -> Result<u8, Box<dyn std::error::Erro
     let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
     let buf_offset = addr - aligned_addr;
     let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
-    trace!("Read word at address {:x}: {:x}", aligned_addr, read_word);
+    trace!(
+        "Read word at address {:#x}: {:#018x}",
+        aligned_addr,
+        read_word
+    );
     Ok(read_word.to_ne_bytes()[buf_offset])
 }
 
@@ -299,7 +303,7 @@ fn set_branch_breakpoints(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (addr, _len) in jump_addresses {
         trace!(
-            "Setting a trap instruction at {:x} in tracee {}'s memory",
+            "Setting a trap instruction at {:#x} in tracee {}'s memory",
             addr,
             pid
         );
@@ -333,7 +337,7 @@ fn handle_trap(
         let region = region_for_address(trap_addr, code_regions).unwrap();
         let region_offset = trap_addr - region.0.start();
         trace!(
-            "Removing a trap at {:x} in tracee {}'s memory",
+            "Removing a trap at {:#x} in tracee {}'s memory",
             trap_addr,
             pid
         );
@@ -346,7 +350,7 @@ fn handle_trap(
         if let WaitStatus::Stopped(_pid, SIGTRAP) = wait_result {
             debug_assert_eq!(pid, _pid);
             trace!(
-                "Setting a trap instruction at {:x} in tracee {}'s memory",
+                "Setting a trap instruction at {:#x} in tracee {}'s memory",
                 trap_addr,
                 pid
             );
@@ -355,10 +359,10 @@ fn handle_trap(
             let orig_instr_size = jump_addresses[orig_instr_loc].1;
             if regs.rip as usize == trap_addr + orig_instr_size as usize {
                 execution_log.push_back((pid, trap_addr, false));
-                trace!("Branch at {:x} not taken by {}!", trap_addr, pid);
+                trace!("Branch at {:#x} not taken by {}!", trap_addr, pid);
             } else {
                 execution_log.push_back((pid, trap_addr, true));
-                trace!("Branch at {:x} taken by {}!", trap_addr, pid);
+                trace!("Branch at {:#x} taken by {}!", trap_addr, pid);
             }
         } else {
             warn!(
@@ -369,7 +373,7 @@ fn handle_trap(
         }
     } else {
         warn!(
-            "Tracee SIGTRAP not caused by the tracer, RIP={:x}",
+            "Tracee SIGTRAP not caused by the tracer, RIP={:#x}",
             regs.rip as usize
         );
     }
@@ -388,11 +392,11 @@ fn trace(
         let wait_result = wait()?;
         let waited_pid = match wait_result {
             WaitStatus::Continued(pid) => {
-                debug!("Continued: pid {}", pid);
+                debug!("PID {} Continued", pid);
                 Some(pid)
             }
             WaitStatus::Exited(pid, ret) => {
-                debug!("Exited: pid {}, ret {}", pid, ret);
+                debug!("PID {} Exited: ret {}", pid, ret);
                 traced_processes -= 1;
                 if traced_processes == 0 {
                     trace!("Last tracee exited, exiting");
@@ -403,7 +407,7 @@ fn trace(
             WaitStatus::PtraceEvent(pid, signal, value) => {
                 let event = int_to_ptrace_event(value).unwrap();
                 debug!(
-                    "PtraceEvent: pid {}, signal {}, value {:?}",
+                    "PID {} PtraceEvent: signal {}, value {:?}",
                     pid, signal, event,
                 );
                 if let Event::PTRACE_EVENT_CLONE | Event::PTRACE_EVENT_FORK = event {
@@ -412,14 +416,11 @@ fn trace(
                 Some(pid)
             }
             WaitStatus::PtraceSyscall(pid) => {
-                debug!("PtraceSyscall: pid {}", pid);
+                debug!("PID {} PtraceSyscall", pid);
                 Some(pid)
             }
             WaitStatus::Signaled(pid, signal, dumped) => {
-                debug!(
-                    "Signaled: pid {}, signal {}, dumped {}",
-                    pid, signal, dumped
-                );
+                debug!("PID {} Signaled: signal {}, dumped {}", pid, signal, dumped);
                 Some(pid)
             }
             WaitStatus::StillAlive => {
@@ -427,9 +428,9 @@ fn trace(
                 None
             }
             WaitStatus::Stopped(pid, signal) => {
-                debug!("Stopped: pid {}, signal {}", pid, signal);
+                debug!("PID {} Stopped: signal {}", pid, signal);
                 match signal {
-                    SIGSTOP => Some(pid),
+                    SIGSTOP | SIGCHLD => Some(pid),
                     SIGTRAP => Some(handle_trap(
                         pid,
                         jump_addresses,
@@ -465,7 +466,7 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
         info!("Attached to {}", child_pid);
     } else if args.command.len() > 0 {
         ptrace_options |= Options::PTRACE_O_EXITKILL;
-        // TODO implement passing environment variables to the command
+        // TODO implement passing user specified environment variables to the command
         unsafe {
             let child = Command::new(args.command.first().unwrap())
                 .args(&args.command[1..])
@@ -501,6 +502,7 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
         &code_regions,
         &mut execution_log,
     )
+    // TODO remove breakpoints after canceling tracer for attach pid mode
 }
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
