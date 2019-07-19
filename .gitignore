@@ -12,3 +12,5 @@ Cargo.lock
 
 /target
 #**/*.rs.bk
+.idea/
+.vscode/

@@ -1,28 +1,58 @@
+#[macro_use]
+extern crate lazy_static;
+
 use core::borrow::Borrow;
+use std::{mem, ptr};
+use std::collections::HashSet;
+use std::collections::vec_deque::VecDeque;
 use std::error::Error;
 use std::ffi::c_void;
+use std::fmt;
 use std::fs::read_to_string;
+use std::hash::BuildHasherDefault;
 use std::io::Error as IoError;
+use std::mem::transmute;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-use std::{mem, ptr};
 
+use ahash::AHasher;
+use capstone::Insn;
 use capstone::prelude::*;
 use clap;
 use libc;
 use log::{debug, error, info, trace, warn};
 use nix::errno::Errno;
 use nix::sys::ptrace::{
-    attach, cont, read, setoptions, step, traceme, write, Event, Options, Request, RequestType,
+    attach, cont, Event, Options, read, Request, RequestType, setoptions, step, traceme, write,
 };
 use nix::sys::signal::{SIGCHLD, SIGSTOP, SIGTRAP};
-use nix::sys::uio::{process_vm_readv, IoVec, RemoteIoVec};
+use nix::sys::uio::{IoVec, process_vm_readv, RemoteIoVec};
 use nix::sys::wait::{wait, waitpid, WaitStatus};
 use nix::unistd::Pid;
 use proc_maps::{get_process_maps, MapRange};
-use std::collections::vec_deque::VecDeque;
-use std::mem::transmute;
+use regex::Regex;
 use structopt::StructOpt;
+
+#[derive(Debug)]
+pub enum ToolError {
+    ArchitectureNotSupported,
+}
+
+impl fmt::Display for ToolError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            ToolError::ArchitectureNotSupported => f.write_str("ArchitectureNotSupported"),
+        }
+    }
+}
+
+impl Error for ToolError {
+    fn description(&self) -> &str {
+        match *self {
+            ToolError::ArchitectureNotSupported => "Architecture not supported",
+        }
+    }
+}
 
 #[derive(StructOpt)]
 /// Trace the execution path of a program.
@@ -82,9 +112,9 @@ fn get_code_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Error
             );
             map.is_exec()
                 && map
-                    .filename()
-                    .as_ref()
-                    .map_or(false, |name| name.ends_with(original_cmd))
+                .filename()
+                .as_ref()
+                .map_or(false, |name| name.ends_with(original_cmd))
         })
         .map(|map| {
             let mut buf = Vec::<u8>::with_capacity(map.size());
@@ -115,37 +145,147 @@ fn get_code_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Error
     Ok(code_maps_with_buffers)
 }
 
-const INITIAL_JUMP_VEC_CAPACITY: usize = 4096;
+const X86_MAX_INSTR_LEN: usize = 15;
+const JUMP_GROUP: u8 = 1;
+const CALL_GROUP: u8 = 2;
+const RET_GROUP: u8 = 3;
+const IRET_GROUP: u8 = 5;
+const BRANCH_RELATIVE_GROUP: u8 = 7;
 
-type JumpAddresses = Vec<(usize, u8)>;
 
-fn find_jumps(code_regions: &MemoryRegions) -> Result<JumpAddresses, Box<dyn std::error::Error>> {
-    const JUMP_GROUP: u8 = 1;
-    const BRANCH_RELATIVE_GROUP: u8 = 7;
+/// Checks if the given instruction is a unconditional jump, branch or a call
+/// and returns `None` if it isn't. Returns `Some(addr)` if it is, where `addr`
+/// is the destination address of that instruction.
+fn get_destination_address(ins: &Insn, cs: &Capstone) -> Option<usize> {
+    if let Ok(detail) = cs.insn_detail(&ins) {
+        if detail
+            .groups()
+            .filter(|g| g.0 == JUMP_GROUP || g.0 == BRANCH_RELATIVE_GROUP || g.0 == CALL_GROUP)
+            .count()
+            == 1
+        {
+            let arch_detail = detail.arch_detail();
+            let ops = arch_detail.operands();
+            if ops.len() == 1 {
+                if let X86Operand(x86_operand) = ops[0] {
+                    // TODO try to tackle non-immediate cases (dynamic?)
+                    if let Imm(operand_value) = x86_operand.op_type {
+                        // TODO handle relative address (PIC)
+                        if let Some(x86_detail) = arch_detail.x86() {
 
-    // TODO what about 32-bit mode?
-    let cs_x86 = Capstone::new()
-        .x86()
-        .mode(arch::x86::ArchMode::Mode64)
-        .syntax(arch::x86::ArchSyntax::Intel)
-        .detail(true)
-        .build()?;
-    trace!("Created capstone object");
-    let mut jump_addresses = Vec::with_capacity(INITIAL_JUMP_VEC_CAPACITY);
-    trace!(
-        "Created Vec for jump addresses with {} initial capacity",
-        jump_addresses.capacity()
+                        }
+                        return Some(operand_value)
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_ret(ins: &Insn, cs: &Capstone) -> bool {
+    if let Ok(detail) = cs.insn_detail(&ins) {
+        if detail
+            .groups()
+            .filter(|g| g.0 == RET_GROUP || g.0 == IRET_GROUP)
+            .count()
+            == 1
+        {
+            return true;
+        }
+    }
+    false
+}
+
+const INITIAL_REACHABE_CODE_CAPACITY: usize = 4096;
+
+type ReachableCode = Vec<(usize, u32)>;
+type BranchAddresses = Vec<(usize, u8)>;
+
+fn find_reachable_code(
+    code_regions: &MemoryRegions,
+    cs: &Capstone,
+) -> Result<ReachableCode, Box<dyn std::error::Error>> {
+    let mut reachable_code = Vec::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
+    let mut unprocessed = Vec::<usize>::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
+    let mut processed = HashSet::<usize, BuildHasherDefault<AHasher>>::with_capacity_and_hasher(
+        INITIAL_REACHABE_CODE_CAPACITY,
+        BuildHasherDefault::<AHasher>::default(),
     );
+
     for (map, buf) in code_regions {
+        trace!("Parsing code region: {:#?}", map);
+        let header = xmas_elf::header::parse_header(buf)?;
+        let entrypoint: usize = if let xmas_elf::header::HeaderPt2::Header64(h64) = header.pt2 {
+            h64.entry_point as usize
+        } else {
+            return Err(Box::new(ToolError::ArchitectureNotSupported));
+        };
+        unprocessed.push(entrypoint);
+        // by specially crafting the assembly, it is possible to fool this procedure
+        while let Some(addr) = unprocessed.pop() {
+            // TODO handle multiple code regions correctly
+            if addr > map.start() && addr < map.start() + map.size() {
+                let was_in = processed.insert(addr);
+                debug_assert!(!was_in);
+
+                let mut pos = addr;
+                loop {
+                    let insns =
+                        cs.disasm_count(&buf[pos - map.start()..X86_MAX_INSTR_LEN], pos as u64, 1)?;
+                    if insns.is_empty() {
+                        break;
+                    } else {
+                        for ins in insns.iter() {
+                            if let Ok(detail) = cs.insn_detail(&ins) {
+                                if detail
+                                    .groups()
+                                    .filter(|g| g.0 == JUMP_GROUP || g.0 == BRANCH_RELATIVE_GROUP)
+                                    .count()
+                                    == 2
+                                {
+                                    // TODO retrieve jump address from
+
+                                    // debug!("Instruction detected for trap tracing: {} ", ins);
+                                    // branch_addresses
+                                    // .push((ins.address() as usize, ins.bytes().len() as u8));
+                                }
+                            }
+                            pos += ins.bytes().len();
+                        }
+                    }
+                }
+
+                // TODO add jumps, branches and calls to unprocessed if they are not in processed
+
+                // TODO end then reaching ret or exit syscall
+            }
+        }
+    }
+    Ok(reachable_code)
+}
+
+fn find_branches(
+    code_regions: &MemoryRegions,
+    reachable_code: &ReachableCode,
+    cs: &Capstone,
+) -> Result<BranchAddresses, Box<dyn std::error::Error>> {
+    let mut branch_addresses = Vec::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
+
+    // TODO
+
+    for (map, buf) in code_regions {
+        trace!("Parsing code region: {:#?}", map);
+
         let mut pos = 0;
         // capstone iteration stops on invalid bytes, so loop is needed here
         while pos < map.size() {
-            let insns = cs_x86.disasm_all(&buf[pos..], (map.start() + pos) as u64)?;
+            let insns = cs.disasm_all(&buf[pos..], (map.start() + pos) as u64)?;
             if insns.is_empty() {
                 pos += 1;
             } else {
                 for ins in insns.iter() {
-                    if let Ok(detail) = cs_x86.insn_detail(&ins) {
+                    if let Ok(detail) = cs.insn_detail(&ins) {
                         if detail
                             .groups()
                             .filter(|g| g.0 == JUMP_GROUP || g.0 == BRANCH_RELATIVE_GROUP)
@@ -153,7 +293,8 @@ fn find_jumps(code_regions: &MemoryRegions) -> Result<JumpAddresses, Box<dyn std
                             == 2
                         {
                             debug!("Instruction detected for trap tracing: {} ", ins);
-                            jump_addresses.push((ins.address() as usize, ins.bytes().len() as u8));
+                            branch_addresses
+                                .push((ins.address() as usize, ins.bytes().len() as u8));
                         }
                     }
                     pos += ins.bytes().len();
@@ -161,20 +302,20 @@ fn find_jumps(code_regions: &MemoryRegions) -> Result<JumpAddresses, Box<dyn std
             }
         }
     }
-    let jumps_before_dedup = jump_addresses.len();
-    jump_addresses.sort_by_key(|s| s.0);
-    jump_addresses.dedup_by_key(|s| s.0);
+    let jumps_before_dedup = branch_addresses.len();
+    branch_addresses.sort_by_key(|s| s.0);
+    branch_addresses.dedup_by_key(|s| s.0);
     debug_assert_eq!(
-        jump_addresses.len(),
+        branch_addresses.len(),
         jumps_before_dedup,
         "Same instruction was presented twice"
     );
     debug!(
         "Vec for branch instructions info has {}/{} entries",
-        jump_addresses.len(),
-        jump_addresses.capacity()
+        branch_addresses.len(),
+        branch_addresses.capacity()
     );
-    Ok(jump_addresses)
+    Ok(branch_addresses)
 }
 
 fn tracee_set_byte(pid: Pid, addr: usize, byte: u8) -> Result<(), Box<dyn std::error::Error>> {
@@ -267,6 +408,7 @@ fn tracee_set_registers(pid: Pid, regs: &Registers) -> Result<(), Box<dyn std::e
 
 fn tracee_get_registers(pid: Pid) -> Result<Registers, Box<dyn std::error::Error>> {
     trace!("Reading tracee {}'s registers", pid);
+    // TODO use MaybeUninit when it works for structs
     let regs: Registers = unsafe { mem::uninitialized() };
     let res = unsafe {
         libc::ptrace(
@@ -299,13 +441,12 @@ const TRAP_X86: u8 = 0xCC;
 
 fn set_branch_breakpoints(
     pid: Pid,
-    jump_addresses: &JumpAddresses,
+    jump_addresses: &BranchAddresses,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (addr, _len) in jump_addresses {
-        trace!(
+        debug!(
             "Setting a trap instruction at {:#x} in tracee {}'s memory",
-            addr,
-            pid
+            addr, pid
         );
         tracee_set_byte(pid, *addr, TRAP_X86)?;
     }
@@ -327,7 +468,7 @@ type ExecutionPathLog = VecDeque<ExecutionPathEntry>;
 
 fn handle_trap(
     pid: Pid,
-    jump_addresses: &JumpAddresses,
+    jump_addresses: &BranchAddresses,
     code_regions: &MemoryRegions,
     execution_log: &mut ExecutionPathLog,
 ) -> Result<Pid, Box<dyn std::error::Error>> {
@@ -382,7 +523,7 @@ fn handle_trap(
 
 fn trace(
     _pid: Pid,
-    jump_addresses: &JumpAddresses,
+    jump_addresses: &BranchAddresses,
     code_regions: &MemoryRegions,
     execution_log: &mut ExecutionPathLog,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -449,7 +590,7 @@ fn trace(
     }
 }
 
-const INITIAL_EXECUTION_LOG_CAPACITY: usize = 134217728;
+const INITIAL_EXECUTION_LOG_CAPACITY: usize = 134_217_728;
 
 fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let child_pid: Pid;
@@ -464,7 +605,7 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
         child_pid = Pid::from_raw(pid as i32);
         attach(child_pid)?;
         info!("Attached to {}", child_pid);
-    } else if args.command.len() > 0 {
+    } else if !args.command.is_empty() {
         ptrace_options |= Options::PTRACE_O_EXITKILL;
         // TODO implement passing user specified environment variables to the command
         unsafe {
@@ -472,7 +613,7 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .args(&args.command[1..])
                 .pre_exec(|| {
                     trace!("Child process initiating tracing");
-                    if let Err(_) = traceme() {
+                    if traceme().is_err() {
                         return Err(IoError::last_os_error());
                     }
                     Ok(())
@@ -493,7 +634,16 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
     trace!("Set tracing options for tracee {}", child_pid);
     // TODO handle case with code being loaded dynamically in runtime (plugins)
     let code_regions = get_code_regions(child_pid)?;
-    let jump_addresses = find_jumps(&code_regions)?;
+    // TODO what about 32-bit mode?
+    let cs_x86 = Capstone::new()
+        .x86()
+        .mode(arch::x86::ArchMode::Mode64)
+        .syntax(arch::x86::ArchSyntax::Intel)
+        .detail(true)
+        .build()?;
+    trace!("Created capstone object");
+    let reachable = find_reachable_code(&code_regions, &cs_x86)?;
+    let jump_addresses = find_branches(&code_regions, &reachable, &cs_x86)?;
     set_branch_breakpoints(child_pid, &jump_addresses)?;
     let mut execution_log = ExecutionPathLog::with_capacity(INITIAL_EXECUTION_LOG_CAPACITY);
     trace(
@@ -512,13 +662,9 @@ fn main() {
     if let Err(top_e) = run(args) {
         error!("{}", top_e.to_string());
         let mut e: &Error = top_e.borrow();
-        loop {
-            if let Some(source) = e.source() {
-                error!("Caused by: {}", source.to_string());
-                e = source;
-            } else {
-                break;
-            }
+        while let Some(source) = e.source() {
+            error!("Caused by: {}", source.to_string());
+            e = source;
         }
     }
 }

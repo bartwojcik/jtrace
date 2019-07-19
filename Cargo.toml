@@ -2,17 +2,22 @@
 name = "jtrace"
 version = "0.1.0"
 authors = ["Bartosz Wojcik <bartwojc@gmail.com>"]
+description = "A set of simple tools for dynamic analysis of program control flow."
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/bartwojcik/jtrace"
+keywords = ["analysis", "binary", "control", "dynamic", "flow"]
 edition = "2018"
 
 [dependencies]
+ahash = "0.2.4"
 capstone = "0.6.0"
 clap = "2.33.0"
 env_logger = "0.6.1"
+lazy_static = "1.3.0"
 libc = "0.2.54"
 log = "0.4.6"
 nix = "0.13.0"
+regex = "1.1.9"
 proc-maps = "0.1.5"
 structopt = "0.2.15"
-
-#[patch.crates-io]
-#nix = { path = "/home/bw/RustProjs/nix" }
+xmas-elf = "0.7.0"
