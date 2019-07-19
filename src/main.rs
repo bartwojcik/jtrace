@@ -1,6 +1,3 @@
-#[macro_use]
-extern crate lazy_static;
-
 use core::borrow::Borrow;
 use std::{mem, ptr};
 use std::collections::HashSet;
@@ -16,6 +13,8 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 use ahash::AHasher;
+use capstone::arch::ArchOperand::X86Operand;
+use capstone::arch::x86::X86OperandType::*;
 use capstone::Insn;
 use capstone::prelude::*;
 use clap;
@@ -30,7 +29,6 @@ use nix::sys::uio::{IoVec, process_vm_readv, RemoteIoVec};
 use nix::sys::wait::{wait, waitpid, WaitStatus};
 use nix::unistd::Pid;
 use proc_maps::{get_process_maps, MapRange};
-use regex::Regex;
 use structopt::StructOpt;
 
 #[derive(Debug)]
@@ -167,14 +165,12 @@ fn get_destination_address(ins: &Insn, cs: &Capstone) -> Option<usize> {
             let arch_detail = detail.arch_detail();
             let ops = arch_detail.operands();
             if ops.len() == 1 {
-                if let X86Operand(x86_operand) = ops[0] {
+                if let X86Operand(x86_operand) = &ops[0] {
                     // TODO try to tackle non-immediate cases (dynamic?)
                     if let Imm(operand_value) = x86_operand.op_type {
-                        // TODO handle relative address (PIC)
-                        if let Some(x86_detail) = arch_detail.x86() {
-
-                        }
-                        return Some(operand_value)
+                        // TODO handle different types of jumps (short, near, absolute)
+                        let destination_addr = (ins.address() as i64) + operand_value;
+                        return Some(destination_addr as usize);
                     }
                 }
             }
@@ -183,7 +179,22 @@ fn get_destination_address(ins: &Insn, cs: &Capstone) -> Option<usize> {
     None
 }
 
+fn is_branch(ins: &Insn, cs: &Capstone) -> bool {
+    if let Ok(detail) = cs.insn_detail(&ins) {
+        if detail
+            .groups()
+            .filter(|g| g.0 == JUMP_GROUP || g.0 == BRANCH_RELATIVE_GROUP)
+            .count()
+            == 2
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_ret(ins: &Insn, cs: &Capstone) -> bool {
+    // TODO handle exit syscall
     if let Ok(detail) = cs.insn_detail(&ins) {
         if detail
             .groups()
@@ -237,28 +248,20 @@ fn find_reachable_code(
                         break;
                     } else {
                         for ins in insns.iter() {
-                            if let Ok(detail) = cs.insn_detail(&ins) {
-                                if detail
-                                    .groups()
-                                    .filter(|g| g.0 == JUMP_GROUP || g.0 == BRANCH_RELATIVE_GROUP)
-                                    .count()
-                                    == 2
-                                {
-                                    // TODO retrieve jump address from
-
-                                    // debug!("Instruction detected for trap tracing: {} ", ins);
-                                    // branch_addresses
-                                    // .push((ins.address() as usize, ins.bytes().len() as u8));
+                            if is_ret(&ins, cs) {
+                                // ret means we have reached the end of code block
+                                reachable_code.push((addr, (pos - addr) as u32));
+                                break;
+                            }
+                            if let Some(target_addr) = get_destination_address(&ins, cs) {
+                                if !processed.contains(&target_addr) {
+                                    unprocessed.push(target_addr);
                                 }
                             }
                             pos += ins.bytes().len();
                         }
                     }
                 }
-
-                // TODO add jumps, branches and calls to unprocessed if they are not in processed
-
-                // TODO end then reaching ret or exit syscall
             }
         }
     }
