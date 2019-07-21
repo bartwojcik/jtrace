@@ -1,5 +1,6 @@
 use core::borrow::Borrow;
 use std::{mem, ptr};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::collections::vec_deque::VecDeque;
 use std::error::Error;
@@ -85,7 +86,7 @@ fn int_to_ptrace_event(value: i32) -> Option<Event> {
 type MemoryRegion = (MapRange, Vec<u8>);
 type MemoryRegions = Vec<MemoryRegion>;
 
-fn get_code_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Error>> {
+fn get_memory_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Error>> {
     let maps = get_process_maps(pid.as_raw())?;
     debug!("Read tracee {} memory maps from procfs", pid);
     let original_cmdline = read_to_string(format!("/proc/{}/cmdline", pid))?;
@@ -108,7 +109,8 @@ fn get_code_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Error
                 map.inode,
                 map.filename().as_ref().map_or("", |s| &**s)
             );
-            map.is_exec()
+//            map.is_exec()
+            map.
                 && map
                 .filename()
                 .as_ref()
@@ -140,6 +142,7 @@ fn get_code_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Error
         warn!("process_vm_readv bytes read return value does not match expected value, continuing");
         debug_assert!(false);
     }
+    code_maps_with_buffers.sort_unstable_by_key(|(map, _buf)| map.start());
     Ok(code_maps_with_buffers)
 }
 
@@ -150,6 +153,34 @@ const RET_GROUP: u8 = 3;
 const IRET_GROUP: u8 = 5;
 const BRANCH_RELATIVE_GROUP: u8 = 7;
 
+fn is_branch(ins: &Insn, cs: &Capstone) -> bool {
+    if let Ok(detail) = cs.insn_detail(&ins) {
+        if detail
+            .groups()
+            .filter(|g| g.0 == JUMP_GROUP || g.0 == BRANCH_RELATIVE_GROUP)
+            .count()
+            == 2
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_ret(ins: &Insn, cs: &Capstone) -> bool {
+    // TODO handle exit syscall
+    if let Ok(detail) = cs.insn_detail(&ins) {
+        if detail
+            .groups()
+            .filter(|g| g.0 == RET_GROUP || g.0 == IRET_GROUP)
+            .count()
+            > 0
+        {
+            return true;
+        }
+    }
+    false
+}
 
 /// Checks if the given instruction is a unconditional jump, branch or a call
 /// and returns `None` if it isn't. Returns `Some(addr)` if it is, where `addr`
@@ -179,35 +210,6 @@ fn get_destination_address(ins: &Insn, cs: &Capstone) -> Option<usize> {
     None
 }
 
-fn is_branch(ins: &Insn, cs: &Capstone) -> bool {
-    if let Ok(detail) = cs.insn_detail(&ins) {
-        if detail
-            .groups()
-            .filter(|g| g.0 == JUMP_GROUP || g.0 == BRANCH_RELATIVE_GROUP)
-            .count()
-            == 2
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_ret(ins: &Insn, cs: &Capstone) -> bool {
-    // TODO handle exit syscall
-    if let Ok(detail) = cs.insn_detail(&ins) {
-        if detail
-            .groups()
-            .filter(|g| g.0 == RET_GROUP || g.0 == IRET_GROUP)
-            .count()
-            == 1
-        {
-            return true;
-        }
-    }
-    false
-}
-
 const INITIAL_REACHABE_CODE_CAPACITY: usize = 4096;
 
 type ReachableCode = Vec<(usize, u32)>;
@@ -223,7 +225,6 @@ fn find_reachable_code(
         INITIAL_REACHABE_CODE_CAPACITY,
         BuildHasherDefault::<AHasher>::default(),
     );
-
     for (map, buf) in code_regions {
         trace!("Parsing code region: {:#?}", map);
         let header = xmas_elf::header::parse_header(buf)?;
@@ -243,7 +244,8 @@ fn find_reachable_code(
                 let mut pos = addr;
                 loop {
                     let insns =
-                        cs.disasm_count(&buf[pos - map.start()..X86_MAX_INSTR_LEN], pos as u64, 1)?;
+                        cs.disasm_count(&buf[pos - map.start()..pos - map.start() + X86_MAX_INSTR_LEN],
+                                        pos as u64, 1)?;
                     if insns.is_empty() {
                         break;
                     } else {
@@ -268,51 +270,47 @@ fn find_reachable_code(
     Ok(reachable_code)
 }
 
+fn get_region_for_address(code_regions: &MemoryRegions, addr: usize) -> Option<&MemoryRegion> {
+    let found = code_regions.binary_search_by(|map| if addr > map.0.start()
+        && addr < map.0.start() + map.0.size() { Ordering::Equal } //
+    else if addr < map.0.start() { Ordering::Less }//
+    else { Ordering::Greater });
+    if let Ok(index) = found {
+        Some(&code_regions[index])
+    } else {
+        None
+    }
+}
+
 fn find_branches(
     code_regions: &MemoryRegions,
     reachable_code: &ReachableCode,
     cs: &Capstone,
 ) -> Result<BranchAddresses, Box<dyn std::error::Error>> {
     let mut branch_addresses = Vec::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
-
-    // TODO
-
-    for (map, buf) in code_regions {
-        trace!("Parsing code region: {:#?}", map);
-
-        let mut pos = 0;
-        // capstone iteration stops on invalid bytes, so loop is needed here
-        while pos < map.size() {
-            let insns = cs.disasm_all(&buf[pos..], (map.start() + pos) as u64)?;
-            if insns.is_empty() {
-                pos += 1;
-            } else {
-                for ins in insns.iter() {
-                    if let Ok(detail) = cs.insn_detail(&ins) {
-                        if detail
-                            .groups()
-                            .filter(|g| g.0 == JUMP_GROUP || g.0 == BRANCH_RELATIVE_GROUP)
-                            .count()
-                            == 2
-                        {
-                            debug!("Instruction detected for trap tracing: {} ", ins);
-                            branch_addresses
-                                .push((ins.address() as usize, ins.bytes().len() as u8));
+    for (addr, size) in reachable_code {
+        if let Some(region) = get_region_for_address(code_regions, *addr) {
+            let (map, buf) = region;
+            let mut pos = *addr;
+            while pos < *addr + *size as usize {
+                let insns =
+                    cs.disasm_count(&buf[pos - map.start()..pos - map.start() + X86_MAX_INSTR_LEN],
+                                    pos as u64, 1)?;
+                if insns.is_empty() {
+                    break;
+                } else {
+                    for ins in insns.iter() {
+                        if is_branch(&ins, cs) {
+                            branch_addresses.push((pos, ins.bytes().len() as u8));
                         }
+                        pos += ins.bytes().len();
                     }
-                    pos += ins.bytes().len();
                 }
             }
         }
     }
-    let jumps_before_dedup = branch_addresses.len();
-    branch_addresses.sort_by_key(|s| s.0);
+    branch_addresses.sort_unstable_by_key(|s| s.0);
     branch_addresses.dedup_by_key(|s| s.0);
-    debug_assert_eq!(
-        branch_addresses.len(),
-        jumps_before_dedup,
-        "Same instruction was presented twice"
-    );
     debug!(
         "Vec for branch instructions info has {}/{} entries",
         branch_addresses.len(),
@@ -636,7 +634,7 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
     setoptions(child_pid, ptrace_options)?;
     trace!("Set tracing options for tracee {}", child_pid);
     // TODO handle case with code being loaded dynamically in runtime (plugins)
-    let code_regions = get_code_regions(child_pid)?;
+    let code_regions = get_memory_regions(child_pid)?;
     // TODO what about 32-bit mode?
     let cs_x86 = Capstone::new()
         .x86()
