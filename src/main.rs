@@ -14,7 +14,9 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 use ahash::AHasher;
+use capstone::arch::ArchOperand;
 use capstone::arch::ArchOperand::X86Operand;
+use capstone::arch::x86::X86OperandType;
 use capstone::arch::x86::X86OperandType::*;
 use capstone::Insn;
 use capstone::prelude::*;
@@ -31,6 +33,8 @@ use nix::sys::wait::{wait, waitpid, WaitStatus};
 use nix::unistd::Pid;
 use proc_maps::{get_process_maps, MapRange};
 use structopt::StructOpt;
+
+use InstructionType::*;
 
 #[derive(Debug)]
 pub enum ToolError {
@@ -166,49 +170,70 @@ const JUMP_GROUP: u8 = 1;
 const CALL_GROUP: u8 = 2;
 const RET_GROUP: u8 = 3;
 const IRET_GROUP: u8 = 5;
-const BRANCH_RELATIVE_GROUP: u8 = 7;
+//const BRANCH_RELATIVE_GROUP: u8 = 7;
+
+const JMP_OPCODES: [u8; 3] = [0xffu8, 0xe9u8, 0xebu8];
 
 fn is_group(detail: &InsnDetail, group_id: u8) -> bool {
     detail.groups().filter(|g| g.0 == group_id).count() == 1
 }
 
-fn is_ret(ins: &Insn, detail: &InsnDetail, cs: &Capstone) -> bool {
-    // TODO handle exit syscall
-    let group_names = Vec::from_iter(detail.groups().map(|g| cs.group_name(g).unwrap_or("".to_string())));
-    trace!("[is_ret]\t{:#x}\t{} {}\t\tGroups:{:?}",
-           ins.address(),
-           ins.mnemonic().unwrap_or(""),
-           ins.op_str().unwrap_or(""),
-           group_names);
+fn is_ret(detail: &InsnDetail) -> bool {
     detail.groups().filter(|g| g.0 == RET_GROUP || g.0 == IRET_GROUP).count() > 0
 }
 
-/// Checks if the given instruction is a unconditional jump, branch or a call
-/// and returns `None` if it isn't. Returns `Some(addr)` if it is, where `addr`
-/// is the destination address of that instruction.
-fn get_destination_address(ins: &Insn, detail: &InsnDetail) -> Option<usize> {
-    if detail.groups().filter(|g| g.0 == JUMP_GROUP || g.0 == CALL_GROUP).count() == 1
-    {
-        let arch_detail = detail.arch_detail();
-        let ops = arch_detail.operands();
-        if ops.len() == 1 {
-            if let X86Operand(x86_operand) = &ops[0] {
-                // TODO try to tackle non-immediate cases (dynamic?)
-                if let Imm(operand_value) = x86_operand.op_type {
-                    // TODO verify, check if BRANCH_RELATIVE_GROUP imply that it is relative
-                    let is_relative = is_group(detail, BRANCH_RELATIVE_GROUP);
-//                    let destination_addr = if is_relative {
-//                        operand_value
-//                    } else {
-//                        ins.address() as i64 + operand_value
-//                    };
-                    let destination_addr = operand_value;
-                    return Some(destination_addr as usize);
+fn is_unconditional_branch(detail: &InsnDetail, arch_detail: &ArchDetail) -> bool {
+    let opcode = arch_detail.x86().unwrap().opcode()[0];
+    let jmp_opcode =
+        opcode == JMP_OPCODES[0] || opcode == JMP_OPCODES[1] || opcode == JMP_OPCODES[2];
+    return is_group(detail, JUMP_GROUP) && jmp_opcode;
+}
+
+fn get_destination_addr(x86_oper: &X86OperandType) -> Option<usize> {
+    match *x86_oper {
+        Imm(addr) => Some(addr as usize),
+        Mem(x86_op_mem) => {
+            let addr_location = x86_op_mem.disp() as usize;
+            // TODO read the value from memory (e.g. GOT)
+            // pid? :(
+//            let addr = read(pid, addr_location as *mut c_void)? as usize;
+//            Some(addr)
+            Some(666)
+        },
+        _ => None,
+    }
+}
+
+enum InstructionType<'a> {
+    Normal,
+    UnconditionalJump(&'a X86OperandType),
+    ConditionalJump(&'a X86OperandType),
+    Call(&'a X86OperandType),
+}
+
+/// Checks if the given instruction is a unconditional jump, branch or a call.
+fn analyze_instruction<'a>(
+    ins: &Insn,
+    detail: &InsnDetail,
+    arch_detail: &ArchDetail,
+    ops: &'a Vec<ArchOperand>,
+) -> InstructionType<'a> {
+    if ops.len() == 1 {
+        if let X86Operand(x86_operand) = &ops[0] {
+            // TODO try to tackle non-immediate cases (e.g. jmp rax, jmp qword ptr [rax]?)
+            let jump_operand = &x86_operand.op_type;
+            if is_group(detail, JUMP_GROUP) {
+                if is_unconditional_branch(detail, arch_detail) {
+                    return UnconditionalJump(jump_operand);
+                } else {
+                    return ConditionalJump(jump_operand);
                 }
+            } else if is_group(detail, CALL_GROUP) {
+                return Call(jump_operand);
             }
         }
     }
-    None
+    Normal
 }
 
 const INITIAL_REACHABE_CODE_CAPACITY: usize = 4096;
@@ -226,7 +251,27 @@ fn analyze_block(
     branch_addresses: &mut BranchAddresses,
     cs: &Capstone,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let result;
+    if let Some(&value) = processed.get(&start) {
+        result = value;
+    } else {
+        result = analyze_block_uncached(start, code_regions, processed, reachable_code,
+                                        branch_addresses, cs)?;
+        processed.insert(start, result);
+    }
+    return Ok(result);
+}
+
+fn analyze_block_uncached(
+    start: usize,
+    code_regions: &MemoryRegions,
+    processed: &mut HashMap<usize, bool, BuildHasherDefault<AHasher>>,
+    reachable_code: &mut ReachableCode,
+    branch_addresses: &mut BranchAddresses,
+    cs: &Capstone,
+) -> Result<bool, Box<dyn std::error::Error>> {
     if let Some((map, buf)) = region_for_address(start, code_regions) {
+        trace!("Analyzing block at {:#x}", start);
         let mut addr = start;
         loop {
             // assume that the instruction does not cross region boundary
@@ -239,36 +284,58 @@ fn analyze_block(
             } else {
                 for ins in insns.iter() {
                     let detail = cs.insn_detail(&ins)?;
-                    if is_ret(&ins, &detail, cs) {
+                    let group_names = Vec::from_iter(detail.groups().map(|g| cs.group_name(g).unwrap_or("".to_string())));
+                    trace!("\t{:#x}\t{} {}\t\tGroups:{:?}",
+                           ins.address(),
+                           ins.mnemonic().unwrap_or(""),
+                           ins.op_str().unwrap_or(""),
+                           group_names);
+                    let arch_detail = detail.arch_detail();
+                    let ops = arch_detail.operands();
+                    for (i, op) in ops.iter().enumerate() {
+                        if let X86Operand(x86_operand) = op {
+                            trace!("\t\t[Operand {}: {:?}]", i, x86_operand)
+                        }
+                    }
+                    if is_ret(&detail) {
                         // ret means we have reached the end of the code block
                         reachable_code.push((start, (addr - start) as u32));
                         return Ok(true);
                     }
                     // TODO detect endless loops and exit syscall
-                    if let Some(target_addr) = get_destination_address(&ins, &detail) {
-                        if is_group(&detail, CALL_GROUP) {
-                            trace!("Call detected at {:#x} to {:#x}", addr, target_addr);
-                            let returns: bool;
-                            if let Some(value) = processed.get(&target_addr) {
-                                returns = *value;
-                            } else {
-                                returns = analyze_block(target_addr, code_regions, processed,
-                                                        reachable_code, branch_addresses, cs)?;
-                                processed.insert(target_addr, returns);
+                    let analyzed = analyze_instruction(&ins, &detail, &arch_detail, &ops);
+                    match analyzed {
+                        UnconditionalJump(addr_op) => {
+                            let target_addr = get_destination_addr(&addr_op).unwrap();
+                            trace!("Jump detected at {:#x} to {:#x}", addr, target_addr);
+                            // TODO handle these compilcated cases in a more robust way
+                            if let Mem(x86_op_mem) = addr_op {
+                                analyze_block(target_addr, code_regions, processed,
+                                              reachable_code, branch_addresses,
+                                              cs)?;
+                                reachable_code.push((start, (addr - start) as u32));
+                                return Ok(false);
                             }
-                            // call that does not return means we have reached the end of the code block
+                        }
+                        ConditionalJump(addr_op) => {
+                            let target_addr = get_destination_addr(&addr_op).unwrap();
+                            trace!("Branch detected at {:#x} to {:#x}", addr, target_addr);
+                            branch_addresses.push((addr, ins.bytes().len() as u8));
+                        }
+                        Call(addr_op) => {
+                            let target_addr = get_destination_addr(&addr_op).unwrap();
+                            trace!("Call detected at {:#x} to {:#x}", addr, target_addr);
+                            let returns = analyze_block(target_addr, code_regions, processed,
+                                                        reachable_code, branch_addresses,
+                                                        cs)?;
+                            // call that does not return means we have reached
+                            // the end of the code block
                             if !returns {
                                 reachable_code.push((start, (addr - start) as u32));
                                 return Ok(false);
                             }
                         }
-                        // TODO handle and discern unconditional and conditional jumps
-                        // especially jumps out of the current code block
-                        // unconditional jump forward means we have reached the end of the code block?
-                        if is_group(&detail, JUMP_GROUP) {
-                            trace!("Branch detected at {:#x} to {:#x}", addr, target_addr);
-                            branch_addresses.push((addr, ins.bytes().len() as u8));
-                        }
+                        Normal => (),
                     }
                     addr += ins.bytes().len();
                 }
@@ -287,7 +354,6 @@ fn analyze_regions(
 ) -> Result<(ReachableCode, BranchAddresses), Box<dyn std::error::Error>> {
     let mut reachable_code = Vec::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
     let mut branch_addresses = Vec::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
-//    let mut unprocessed = Vec::<usize>::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
     let mut processed = HashMap::<usize, bool, BuildHasherDefault<AHasher>>::with_capacity_and_hasher(
         INITIAL_REACHABE_CODE_CAPACITY,
         BuildHasherDefault::<AHasher>::default(),
