@@ -1,7 +1,6 @@
 use core::borrow::Borrow;
 use std::{mem, ptr};
-use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::collections::vec_deque::VecDeque;
 use std::error::Error;
 use std::ffi::c_void;
@@ -9,6 +8,7 @@ use std::fmt;
 use std::fs::read_to_string;
 use std::hash::BuildHasherDefault;
 use std::io::Error as IoError;
+use std::iter::FromIterator;
 use std::mem::transmute;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -35,12 +35,16 @@ use structopt::StructOpt;
 #[derive(Debug)]
 pub enum ToolError {
     ArchitectureNotSupported,
+    AddressOutsideRegion(usize),
+    InvalidInstruction(usize),
 }
 
 impl fmt::Display for ToolError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             ToolError::ArchitectureNotSupported => f.write_str("ArchitectureNotSupported"),
+            ToolError::AddressOutsideRegion(addr) => f.write_str(&format!("AddressOutsideRegion({})", addr)),
+            ToolError::InvalidInstruction(addr) => f.write_str(&format!("InvalidInstruction({})", addr)),
         }
     }
 }
@@ -49,6 +53,9 @@ impl Error for ToolError {
     fn description(&self) -> &str {
         match *self {
             ToolError::ArchitectureNotSupported => "Architecture not supported",
+            ToolError::AddressOutsideRegion(_) =>
+                "Address is outside of the memory region being analyzed - case not yet supported",
+            ToolError::InvalidInstruction(_) => "Invalid instruction detected",
         }
     }
 }
@@ -109,8 +116,7 @@ fn get_memory_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Err
                 map.inode,
                 map.filename().as_ref().map_or("", |s| &**s)
             );
-//            map.is_exec()
-            map.
+            map.inode != 0
                 && map
                 .filename()
                 .as_ref()
@@ -146,6 +152,15 @@ fn get_memory_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Err
     Ok(code_maps_with_buffers)
 }
 
+fn region_for_address(addr: usize, code_regions: &MemoryRegions) -> Option<&MemoryRegion> {
+    for region in code_regions {
+        if addr > region.0.start() && addr < region.0.start() + region.0.size() {
+            return Some(region);
+        }
+    }
+    None
+}
+
 const X86_MAX_INSTR_LEN: usize = 15;
 const JUMP_GROUP: u8 = 1;
 const CALL_GROUP: u8 = 2;
@@ -153,56 +168,42 @@ const RET_GROUP: u8 = 3;
 const IRET_GROUP: u8 = 5;
 const BRANCH_RELATIVE_GROUP: u8 = 7;
 
-fn is_branch(ins: &Insn, cs: &Capstone) -> bool {
-    if let Ok(detail) = cs.insn_detail(&ins) {
-        if detail
-            .groups()
-            .filter(|g| g.0 == JUMP_GROUP || g.0 == BRANCH_RELATIVE_GROUP)
-            .count()
-            == 2
-        {
-            return true;
-        }
-    }
-    false
+fn is_group(detail: &InsnDetail, group_id: u8) -> bool {
+    detail.groups().filter(|g| g.0 == group_id).count() == 1
 }
 
-fn is_ret(ins: &Insn, cs: &Capstone) -> bool {
+fn is_ret(ins: &Insn, detail: &InsnDetail, cs: &Capstone) -> bool {
     // TODO handle exit syscall
-    if let Ok(detail) = cs.insn_detail(&ins) {
-        if detail
-            .groups()
-            .filter(|g| g.0 == RET_GROUP || g.0 == IRET_GROUP)
-            .count()
-            > 0
-        {
-            return true;
-        }
-    }
-    false
+    let group_names = Vec::from_iter(detail.groups().map(|g| cs.group_name(g).unwrap_or("".to_string())));
+    trace!("[is_ret]\t{:#x}\t{} {}\t\tGroups:{:?}",
+           ins.address(),
+           ins.mnemonic().unwrap_or(""),
+           ins.op_str().unwrap_or(""),
+           group_names);
+    detail.groups().filter(|g| g.0 == RET_GROUP || g.0 == IRET_GROUP).count() > 0
 }
 
 /// Checks if the given instruction is a unconditional jump, branch or a call
 /// and returns `None` if it isn't. Returns `Some(addr)` if it is, where `addr`
 /// is the destination address of that instruction.
-fn get_destination_address(ins: &Insn, cs: &Capstone) -> Option<usize> {
-    if let Ok(detail) = cs.insn_detail(&ins) {
-        if detail
-            .groups()
-            .filter(|g| g.0 == JUMP_GROUP || g.0 == BRANCH_RELATIVE_GROUP || g.0 == CALL_GROUP)
-            .count()
-            == 1
-        {
-            let arch_detail = detail.arch_detail();
-            let ops = arch_detail.operands();
-            if ops.len() == 1 {
-                if let X86Operand(x86_operand) = &ops[0] {
-                    // TODO try to tackle non-immediate cases (dynamic?)
-                    if let Imm(operand_value) = x86_operand.op_type {
-                        // TODO handle different types of jumps (short, near, absolute)
-                        let destination_addr = (ins.address() as i64) + operand_value;
-                        return Some(destination_addr as usize);
-                    }
+fn get_destination_address(ins: &Insn, detail: &InsnDetail) -> Option<usize> {
+    if detail.groups().filter(|g| g.0 == JUMP_GROUP || g.0 == CALL_GROUP).count() == 1
+    {
+        let arch_detail = detail.arch_detail();
+        let ops = arch_detail.operands();
+        if ops.len() == 1 {
+            if let X86Operand(x86_operand) = &ops[0] {
+                // TODO try to tackle non-immediate cases (dynamic?)
+                if let Imm(operand_value) = x86_operand.op_type {
+                    // TODO verify, check if BRANCH_RELATIVE_GROUP imply that it is relative
+                    let is_relative = is_group(detail, BRANCH_RELATIVE_GROUP);
+//                    let destination_addr = if is_relative {
+//                        operand_value
+//                    } else {
+//                        ins.address() as i64 + operand_value
+//                    };
+                    let destination_addr = operand_value;
+                    return Some(destination_addr as usize);
                 }
             }
         }
@@ -212,102 +213,97 @@ fn get_destination_address(ins: &Insn, cs: &Capstone) -> Option<usize> {
 
 const INITIAL_REACHABE_CODE_CAPACITY: usize = 4096;
 
+/// Entries have form: (address, block length)
 type ReachableCode = Vec<(usize, u32)>;
+/// Entries have form: (address, instruction length)
 type BranchAddresses = Vec<(usize, u8)>;
 
-fn find_reachable_code(
+fn analyze_block(
+    start: usize,
+    code_regions: &MemoryRegions,
+    processed: &mut HashMap<usize, bool, BuildHasherDefault<AHasher>>,
+    reachable_code: &mut ReachableCode,
+    branch_addresses: &mut BranchAddresses,
+    cs: &Capstone,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some((map, buf)) = region_for_address(start, code_regions) {
+        let mut addr = start;
+        loop {
+            // assume that the instruction does not cross region boundary
+            debug_assert!(addr >= map.start() && addr < map.start() + map.size());
+            let insns =
+                cs.disasm_count(&buf[addr - map.start()..addr - map.start() + X86_MAX_INSTR_LEN],
+                                addr as u64, 1)?;
+            if insns.is_empty() {
+                return Err(Box::new(ToolError::InvalidInstruction(addr)));
+            } else {
+                for ins in insns.iter() {
+                    let detail = cs.insn_detail(&ins)?;
+                    if is_ret(&ins, &detail, cs) {
+                        // ret means we have reached the end of the code block
+                        reachable_code.push((start, (addr - start) as u32));
+                        return Ok(true);
+                    }
+                    // TODO detect endless loops and exit syscall
+                    if let Some(target_addr) = get_destination_address(&ins, &detail) {
+                        if is_group(&detail, CALL_GROUP) {
+                            trace!("Call detected at {:#x} to {:#x}", addr, target_addr);
+                            let returns: bool;
+                            if let Some(value) = processed.get(&target_addr) {
+                                returns = *value;
+                            } else {
+                                returns = analyze_block(target_addr, code_regions, processed,
+                                                        reachable_code, branch_addresses, cs)?;
+                                processed.insert(target_addr, returns);
+                            }
+                            // call that does not return means we have reached the end of the code block
+                            if !returns {
+                                reachable_code.push((start, (addr - start) as u32));
+                                return Ok(false);
+                            }
+                        }
+                        // TODO handle and discern unconditional and conditional jumps
+                        // especially jumps out of the current code block
+                        // unconditional jump forward means we have reached the end of the code block?
+                        if is_group(&detail, JUMP_GROUP) {
+                            trace!("Branch detected at {:#x} to {:#x}", addr, target_addr);
+                            branch_addresses.push((addr, ins.bytes().len() as u8));
+                        }
+                    }
+                    addr += ins.bytes().len();
+                }
+            }
+        }
+    } else {
+        // TODO do not assume that calls to outer regions always return
+        trace!("Skipping analysis at {:#x}, assume that it returns", start);
+        Ok(true)
+    }
+}
+
+fn analyze_regions(
     code_regions: &MemoryRegions,
     cs: &Capstone,
-) -> Result<ReachableCode, Box<dyn std::error::Error>> {
+) -> Result<(ReachableCode, BranchAddresses), Box<dyn std::error::Error>> {
     let mut reachable_code = Vec::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
-    let mut unprocessed = Vec::<usize>::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
-    let mut processed = HashSet::<usize, BuildHasherDefault<AHasher>>::with_capacity_and_hasher(
+    let mut branch_addresses = Vec::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
+//    let mut unprocessed = Vec::<usize>::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
+    let mut processed = HashMap::<usize, bool, BuildHasherDefault<AHasher>>::with_capacity_and_hasher(
         INITIAL_REACHABE_CODE_CAPACITY,
         BuildHasherDefault::<AHasher>::default(),
     );
     for (map, buf) in code_regions {
-        trace!("Parsing code region: {:#?}", map);
+        trace!("Analyzing code region: {:#?}", map);
         let header = xmas_elf::header::parse_header(buf)?;
+        // TODO handle case when the header is not present in this region?
         let entrypoint: usize = if let xmas_elf::header::HeaderPt2::Header64(h64) = header.pt2 {
             h64.entry_point as usize
         } else {
             return Err(Box::new(ToolError::ArchitectureNotSupported));
         };
-        unprocessed.push(entrypoint);
-        // by specially crafting the assembly, it is possible to fool this procedure
-        while let Some(addr) = unprocessed.pop() {
-            // TODO handle multiple code regions correctly
-            if addr > map.start() && addr < map.start() + map.size() {
-                let was_in = processed.insert(addr);
-                debug_assert!(!was_in);
-
-                let mut pos = addr;
-                loop {
-                    let insns =
-                        cs.disasm_count(&buf[pos - map.start()..pos - map.start() + X86_MAX_INSTR_LEN],
-                                        pos as u64, 1)?;
-                    if insns.is_empty() {
-                        break;
-                    } else {
-                        for ins in insns.iter() {
-                            if is_ret(&ins, cs) {
-                                // ret means we have reached the end of code block
-                                reachable_code.push((addr, (pos - addr) as u32));
-                                break;
-                            }
-                            if let Some(target_addr) = get_destination_address(&ins, cs) {
-                                if !processed.contains(&target_addr) {
-                                    unprocessed.push(target_addr);
-                                }
-                            }
-                            pos += ins.bytes().len();
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(reachable_code)
-}
-
-fn get_region_for_address(code_regions: &MemoryRegions, addr: usize) -> Option<&MemoryRegion> {
-    let found = code_regions.binary_search_by(|map| if addr > map.0.start()
-        && addr < map.0.start() + map.0.size() { Ordering::Equal } //
-    else if addr < map.0.start() { Ordering::Less }//
-    else { Ordering::Greater });
-    if let Ok(index) = found {
-        Some(&code_regions[index])
-    } else {
-        None
-    }
-}
-
-fn find_branches(
-    code_regions: &MemoryRegions,
-    reachable_code: &ReachableCode,
-    cs: &Capstone,
-) -> Result<BranchAddresses, Box<dyn std::error::Error>> {
-    let mut branch_addresses = Vec::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
-    for (addr, size) in reachable_code {
-        if let Some(region) = get_region_for_address(code_regions, *addr) {
-            let (map, buf) = region;
-            let mut pos = *addr;
-            while pos < *addr + *size as usize {
-                let insns =
-                    cs.disasm_count(&buf[pos - map.start()..pos - map.start() + X86_MAX_INSTR_LEN],
-                                    pos as u64, 1)?;
-                if insns.is_empty() {
-                    break;
-                } else {
-                    for ins in insns.iter() {
-                        if is_branch(&ins, cs) {
-                            branch_addresses.push((pos, ins.bytes().len() as u8));
-                        }
-                        pos += ins.bytes().len();
-                    }
-                }
-            }
-        }
+        // by specially crafting the assembly, it is easy to fool this procedure
+        analyze_block(entrypoint, code_regions, &mut processed, &mut reachable_code,
+                      &mut branch_addresses, cs)?;
     }
     branch_addresses.sort_unstable_by_key(|s| s.0);
     branch_addresses.dedup_by_key(|s| s.0);
@@ -316,7 +312,7 @@ fn find_branches(
         branch_addresses.len(),
         branch_addresses.capacity()
     );
-    Ok(branch_addresses)
+    Ok((reachable_code, branch_addresses))
 }
 
 fn tracee_set_byte(pid: Pid, addr: usize, byte: u8) -> Result<(), Box<dyn std::error::Error>> {
@@ -452,15 +448,6 @@ fn set_branch_breakpoints(
         tracee_set_byte(pid, *addr, TRAP_X86)?;
     }
     Ok(())
-}
-
-fn region_for_address(addr: usize, code_regions: &MemoryRegions) -> Option<&MemoryRegion> {
-    for region in code_regions {
-        if addr > region.0.start() && addr < region.0.start() + region.0.size() {
-            return Some(region);
-        }
-    }
-    None
 }
 
 // TODO this should be more sophisticated
@@ -643,8 +630,7 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .detail(true)
         .build()?;
     trace!("Created capstone object");
-    let reachable = find_reachable_code(&code_regions, &cs_x86)?;
-    let jump_addresses = find_branches(&code_regions, &reachable, &cs_x86)?;
+    let (_reachable_code, jump_addresses) = analyze_regions(&code_regions, &cs_x86)?;
     set_branch_breakpoints(child_pid, &jump_addresses)?;
     let mut execution_log = ExecutionPathLog::with_capacity(INITIAL_EXECUTION_LOG_CAPACITY);
     trace(
