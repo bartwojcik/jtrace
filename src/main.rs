@@ -9,7 +9,7 @@ use std::fs::read_to_string;
 use std::hash::BuildHasherDefault;
 use std::io::Error as IoError;
 use std::iter::FromIterator;
-use std::mem::transmute;
+use std::mem::{MaybeUninit, transmute};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
@@ -31,6 +31,7 @@ use nix::sys::signal::{SIGCHLD, SIGSTOP, SIGTRAP};
 use nix::sys::uio::{IoVec, process_vm_readv, RemoteIoVec};
 use nix::sys::wait::{wait, waitpid, WaitStatus};
 use nix::unistd::Pid;
+use num_integer::Integer;
 use proc_maps::{get_process_maps, MapRange};
 use structopt::StructOpt;
 
@@ -41,6 +42,7 @@ pub enum ToolError {
     ArchitectureNotSupported,
     AddressOutsideRegion(usize),
     InvalidInstruction(usize),
+    AddressResolutionError(usize),
 }
 
 impl fmt::Display for ToolError {
@@ -49,6 +51,7 @@ impl fmt::Display for ToolError {
             ToolError::ArchitectureNotSupported => f.write_str("ArchitectureNotSupported"),
             ToolError::AddressOutsideRegion(addr) => f.write_str(&format!("AddressOutsideRegion({})", addr)),
             ToolError::InvalidInstruction(addr) => f.write_str(&format!("InvalidInstruction({})", addr)),
+            ToolError::AddressResolutionError(addr) => f.write_str(&format!("AddressResolutionError({})", addr)),
         }
     }
 }
@@ -60,6 +63,7 @@ impl Error for ToolError {
             ToolError::AddressOutsideRegion(_) =>
                 "Address is outside of the memory region being analyzed - case not yet supported",
             ToolError::InvalidInstruction(_) => "Invalid instruction detected",
+            ToolError::AddressResolutionError(_) => "Could not resolve the jump or call destination address",
         }
     }
 }
@@ -189,18 +193,16 @@ fn is_unconditional_branch(detail: &InsnDetail, arch_detail: &ArchDetail) -> boo
     return is_group(detail, JUMP_GROUP) && jmp_opcode;
 }
 
-fn get_destination_addr(x86_oper: &X86OperandType) -> Option<usize> {
+fn get_destination_addr(pid: Pid, ins: &Insn, x86_oper: &X86OperandType)
+                        -> Result<usize, Box<dyn std::error::Error>> {
     match *x86_oper {
-        Imm(addr) => Some(addr as usize),
+        Imm(addr) => Ok(addr as usize),
         Mem(x86_op_mem) => {
             let addr_location = x86_op_mem.disp() as usize;
-            // TODO read the value from memory (e.g. GOT)
-            // pid? :(
-//            let addr = read(pid, addr_location as *mut c_void)? as usize;
-//            Some(addr)
-            Some(666)
-        },
-        _ => None,
+            let addr = read(pid, addr_location as *mut c_void)? as usize;
+            Ok(addr)
+        }
+        _ => Err(Box::new(ToolError::AddressResolutionError(ins.address() as usize))),
     }
 }
 
@@ -213,7 +215,7 @@ enum InstructionType<'a> {
 
 /// Checks if the given instruction is a unconditional jump, branch or a call.
 fn analyze_instruction<'a>(
-    ins: &Insn,
+    _ins: &Insn,
     detail: &InsnDetail,
     arch_detail: &ArchDetail,
     ops: &'a Vec<ArchOperand>,
@@ -244,6 +246,7 @@ type ReachableCode = Vec<(usize, u32)>;
 type BranchAddresses = Vec<(usize, u8)>;
 
 fn analyze_block(
+    pid: Pid,
     start: usize,
     code_regions: &MemoryRegions,
     processed: &mut HashMap<usize, bool, BuildHasherDefault<AHasher>>,
@@ -255,7 +258,7 @@ fn analyze_block(
     if let Some(&value) = processed.get(&start) {
         result = value;
     } else {
-        result = analyze_block_uncached(start, code_regions, processed, reachable_code,
+        result = analyze_block_uncached(pid, start, code_regions, processed, reachable_code,
                                         branch_addresses, cs)?;
         processed.insert(start, result);
     }
@@ -263,6 +266,7 @@ fn analyze_block(
 }
 
 fn analyze_block_uncached(
+    pid: Pid,
     start: usize,
     code_regions: &MemoryRegions,
     processed: &mut HashMap<usize, bool, BuildHasherDefault<AHasher>>,
@@ -284,7 +288,8 @@ fn analyze_block_uncached(
             } else {
                 for ins in insns.iter() {
                     let detail = cs.insn_detail(&ins)?;
-                    let group_names = Vec::from_iter(detail.groups().map(|g| cs.group_name(g).unwrap_or("".to_string())));
+                    let group_names = Vec::from_iter(detail.groups()
+                        .map(|g| cs.group_name(g).unwrap_or("".to_string())));
                     trace!("\t{:#x}\t{} {}\t\tGroups:{:?}",
                            ins.address(),
                            ins.mnemonic().unwrap_or(""),
@@ -306,11 +311,11 @@ fn analyze_block_uncached(
                     let analyzed = analyze_instruction(&ins, &detail, &arch_detail, &ops);
                     match analyzed {
                         UnconditionalJump(addr_op) => {
-                            let target_addr = get_destination_addr(&addr_op).unwrap();
+                            let target_addr = get_destination_addr(pid, &ins, &addr_op)?;
                             trace!("Jump detected at {:#x} to {:#x}", addr, target_addr);
                             // TODO handle these compilcated cases in a more robust way
-                            if let Mem(x86_op_mem) = addr_op {
-                                analyze_block(target_addr, code_regions, processed,
+                            if let Mem(_) = addr_op {
+                                analyze_block(pid, target_addr, code_regions, processed,
                                               reachable_code, branch_addresses,
                                               cs)?;
                                 reachable_code.push((start, (addr - start) as u32));
@@ -318,14 +323,14 @@ fn analyze_block_uncached(
                             }
                         }
                         ConditionalJump(addr_op) => {
-                            let target_addr = get_destination_addr(&addr_op).unwrap();
+                            let target_addr = get_destination_addr(pid, &ins, &addr_op)?;
                             trace!("Branch detected at {:#x} to {:#x}", addr, target_addr);
                             branch_addresses.push((addr, ins.bytes().len() as u8));
                         }
                         Call(addr_op) => {
-                            let target_addr = get_destination_addr(&addr_op).unwrap();
+                            let target_addr = get_destination_addr(pid, &ins, &addr_op)?;
                             trace!("Call detected at {:#x} to {:#x}", addr, target_addr);
-                            let returns = analyze_block(target_addr, code_regions, processed,
+                            let returns = analyze_block(pid, target_addr, code_regions, processed,
                                                         reachable_code, branch_addresses,
                                                         cs)?;
                             // call that does not return means we have reached
@@ -349,6 +354,7 @@ fn analyze_block_uncached(
 }
 
 fn analyze_regions(
+    pid: Pid,
     code_regions: &MemoryRegions,
     cs: &Capstone,
 ) -> Result<(ReachableCode, BranchAddresses), Box<dyn std::error::Error>> {
@@ -368,7 +374,7 @@ fn analyze_regions(
             return Err(Box::new(ToolError::ArchitectureNotSupported));
         };
         // by specially crafting the assembly, it is easy to fool this procedure
-        analyze_block(entrypoint, code_regions, &mut processed, &mut reachable_code,
+        analyze_block(pid, entrypoint, code_regions, &mut processed, &mut reachable_code,
                       &mut branch_addresses, cs)?;
     }
     branch_addresses.sort_unstable_by_key(|s| s.0);
@@ -379,6 +385,76 @@ fn analyze_regions(
         branch_addresses.capacity()
     );
     Ok((reachable_code, branch_addresses))
+}
+
+/// This doesn't work because of: https://github.com/rust-lang/rust/issues/43408
+fn tracee_write<T: Integer + Sized>(pid: Pid, addr: usize, value: T) -> Result<(), Box<dyn std::error::Error>> {
+    let value_buf = unsafe { transmute::<_, [u8; std::mem::size_of::<T>()]>(value) };
+    let to_write_size = std::mem::size_of::<T>();
+    let mut written_bytes = 0;
+    while written_bytes < to_write_size {
+        let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
+        debug_assert_eq!(
+            aligned_addr + addr % std::mem::size_of::<usize>(),
+            addr,
+            "Address alignment computed incorrectly"
+        );
+        let buf_offset = addr - aligned_addr;
+        let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
+        let mut buf = unsafe { transmute::<_, [u8; std::mem::size_of::<usize>()]>(read_word) };
+        while buf_offset < std::mem::size_of::<usize>() && written_bytes < to_write_size {
+            buf[buf_offset] = value_buf[written_bytes];
+            buf_offset += 1;
+            written_bytes += 1;
+        }
+        let write_word = unsafe { transmute::<_, usize>(buf) };
+        trace!(
+            "Overwriting word at address {:#x}: {:#018x} with {:#018x}",
+            aligned_addr,
+            read_word,
+            write_word
+        );
+        // This is tricky - although ptrace's signature says "void *data"
+        // POKEDATA accepts the word to write by value
+        write(pid, aligned_addr as *mut c_void, write_word as *mut c_void)?;
+        debug_assert_eq!(
+            unsafe { transmute::<_, [u8; std::mem::size_of::<usize>()]>(read(pid, aligned_addr as *mut c_void)?) },
+            buf,
+            "Read value is not equal to the written value"
+        );
+        addr += std::mem::size_of::<usize>() - (addr - aligned_addr);
+    }
+    Ok(())
+}
+
+/// This doesn't work because of: https://github.com/rust-lang/rust/issues/43408
+fn tracee_read<T: Sized + Integer>(pid: Pid, addr: usize) -> Result<T, Box<dyn std::error::Error>> {
+    let mut read_buf = MaybeUninit::<[u8; std::mem::size_of::<T>()]>::uninit();
+    let to_read_size = std::mem::size_of::<T>();
+    let mut read_bytes = 0;
+    while read_bytes < to_read_size {
+        let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
+        debug_assert_eq!(
+            aligned_addr + addr % std::mem::size_of::<usize>(),
+            addr,
+            "Address alignment computed incorrectly"
+        );
+        let buf_offset = addr - aligned_addr;
+        let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
+        let mut buf = unsafe { transmute::<_, [u8; std::mem::size_of::<usize>()]>(read_word) };
+        while buf_offset < std::mem::size_of::<usize>() && read_bytes < to_read_size {
+            read_buf[read_bytes] = buf[buf_offset];
+            buf_offset += 1;
+            read_bytes += 1;
+        }
+        trace!(
+            "Read word at address {:#x}: {:#018x}",
+            aligned_addr,
+            read_word
+        );
+        addr += std::mem::size_of::<usize>() - (addr - aligned_addr);
+    }
+    Ok(unsafe { transmute::<_, T>(read_buf) })
 }
 
 fn tracee_set_byte(pid: Pid, addr: usize, byte: u8) -> Result<(), Box<dyn std::error::Error>> {
@@ -696,7 +772,7 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .detail(true)
         .build()?;
     trace!("Created capstone object");
-    let (_reachable_code, jump_addresses) = analyze_regions(&code_regions, &cs_x86)?;
+    let (_reachable_code, jump_addresses) = analyze_regions(child_pid, &code_regions, &cs_x86)?;
     set_branch_breakpoints(child_pid, &jump_addresses)?;
     let mut execution_log = ExecutionPathLog::with_capacity(INITIAL_EXECUTION_LOG_CAPACITY);
     trace(
