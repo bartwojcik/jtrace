@@ -31,7 +31,6 @@ use nix::sys::signal::{SIGCHLD, SIGSTOP, SIGTRAP};
 use nix::sys::uio::{IoVec, process_vm_readv, RemoteIoVec};
 use nix::sys::wait::{wait, waitpid, WaitStatus};
 use nix::unistd::Pid;
-use num_integer::Integer;
 use proc_maps::{get_process_maps, MapRange};
 use structopt::StructOpt;
 
@@ -80,6 +79,165 @@ struct Cli {
     /// The command to be executed
     #[structopt(raw(multiple = "true"))]
     command: Vec<String>,
+}
+
+fn tracee_get_byte(pid: Pid, addr: usize) -> Result<u8, Box<dyn std::error::Error>> {
+    let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
+    let buf_offset = addr - aligned_addr;
+    let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
+    trace!("Read word at address {:#x}: {:#018x}", aligned_addr, read_word);
+    Ok(read_word.to_ne_bytes()[buf_offset])
+}
+
+/// signature is somewhat weird because of: https://github.com/rust-lang/rust/issues/43408
+fn tracee_read(pid: Pid, mut addr: usize, contents: &mut [u8])
+               -> Result<(), Box<dyn std::error::Error>> {
+    let to_read_size = contents.len();
+    let mut read_bytes = 0;
+    while read_bytes < to_read_size {
+        let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
+        debug_assert_eq!(aligned_addr + addr % std::mem::size_of::<usize>(), addr,
+                         "Address alignment computed incorrectly");
+        trace!("Reading byte at {:#x} by reading word at {:#x}", addr, aligned_addr);
+        let mut buf_offset = addr - aligned_addr;
+        let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
+        let buf = unsafe { transmute::<_, [u8; std::mem::size_of::<usize>()]>(read_word) };
+        while buf_offset < std::mem::size_of::<usize>() && read_bytes < to_read_size {
+            contents[read_bytes] = buf[buf_offset];
+            buf_offset += 1;
+            read_bytes += 1;
+        }
+        trace!("Read word at address {:#x}: {:#018x}", aligned_addr, read_word);
+        addr += std::mem::size_of::<usize>() - (addr - aligned_addr);
+    }
+    Ok(())
+}
+
+fn tracee_set_byte(pid: Pid, addr: usize, byte: u8) -> Result<(), Box<dyn std::error::Error>> {
+    let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
+    debug_assert_eq!(aligned_addr + addr % std::mem::size_of::<usize>(), addr,
+                     "Address alignment computed incorrectly");
+    let buf_offset = addr - aligned_addr;
+    let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
+    let mut buf = read_word.to_ne_bytes();
+    buf[buf_offset] = byte;
+    let write_word = unsafe { transmute::<_, usize>(buf) };
+    trace!("Overwriting word at address {:#x}: {:#018x} with {:#018x}",
+           aligned_addr, read_word, write_word);
+    // This is tricky - although ptrace's signature says "void *data"
+    // POKEDATA accepts the word to write by value
+    write(pid, aligned_addr as *mut c_void, write_word as *mut c_void)?;
+    debug_assert_eq!(read(pid, aligned_addr as *mut c_void)?.to_ne_bytes(), buf,
+                     "Read value is not equal to the written value");
+    Ok(())
+}
+
+fn tracee_write(pid: Pid, mut addr: usize, contents: &[u8])
+                -> Result<(), Box<dyn std::error::Error>> {
+    let to_write_size = contents.len();
+    let mut written_bytes = 0;
+    while written_bytes < to_write_size {
+        let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
+        debug_assert_eq!(aligned_addr + addr % std::mem::size_of::<usize>(), addr,
+                         "Address alignment computed incorrectly");
+        let mut buf_offset = addr - aligned_addr;
+        let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
+        let mut buf = unsafe { transmute::<_, [u8; std::mem::size_of::<usize>()]>(read_word) };
+        while buf_offset < std::mem::size_of::<usize>() && written_bytes < to_write_size {
+            buf[buf_offset] = contents[written_bytes];
+            buf_offset += 1;
+            written_bytes += 1;
+        }
+        let write_word = unsafe { transmute::<_, usize>(buf) };
+        trace!("Overwriting word at address {:#x}: {:#018x} with {:#018x}",
+               aligned_addr, read_word, write_word);
+        // This is tricky - although ptrace's signature says "void *data"
+        // POKEDATA accepts the word to write by value
+        write(pid, aligned_addr as *mut c_void, write_word as *mut c_void)?;
+        debug_assert_eq!(
+            unsafe { transmute::<_, [u8; std::mem::size_of::<usize>()]>(read(pid, aligned_addr as *mut c_void)?) },
+            buf, "Read value is not equal to the written value");
+        addr += std::mem::size_of::<usize>() - (addr - aligned_addr);
+    }
+    Ok(())
+}
+
+// TODO remove this when nix/libc starts supporting setregs/getregs for musl targets
+#[repr(C)]
+struct Registers {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rax: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub orig_rax: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub eflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+    pub fs_base: u64,
+    pub gs_base: u64,
+    pub ds: u64,
+    pub es: u64,
+    pub fs: u64,
+    pub gs: u64,
+}
+
+fn tracee_set_registers(pid: Pid, regs: &Registers) -> Result<(), Box<dyn std::error::Error>> {
+    trace!("Writing tracee {}'s registers", pid);
+    let res = unsafe {
+        libc::ptrace(
+            Request::PTRACE_SETREGS as RequestType,
+            libc::pid_t::from(pid),
+            ptr::null_mut::<c_void>(),
+            regs as *const _ as *const c_void,
+        )
+    };
+    Errno::result(res)
+        .map(drop)
+        .map_err(|x| Box::new(x) as Box<dyn std::error::Error>)
+}
+
+fn tracee_get_registers(pid: Pid) -> Result<Registers, Box<dyn std::error::Error>> {
+    trace!("Reading tracee {}'s registers", pid);
+    // TODO use MaybeUninit when it works for structs
+    let regs: Registers = unsafe { mem::uninitialized() };
+    let res = unsafe {
+        libc::ptrace(
+            Request::PTRACE_GETREGS as RequestType,
+            libc::pid_t::from(pid),
+            ptr::null_mut::<Registers>(),
+            &regs as *const _ as *const c_void,
+        )
+    };
+    Errno::result(res)?;
+    Ok(regs)
+}
+
+fn tracee_save_registers(pid: Pid, regs: &mut Registers) -> Result<(), Box<dyn std::error::Error>> {
+    trace!("Reading tracee {}'s registers", pid);
+    let res = unsafe {
+        libc::ptrace(
+            Request::PTRACE_GETREGS as RequestType,
+            libc::pid_t::from(pid),
+            ptr::null_mut::<Registers>(),
+            regs as *const _ as *const c_void,
+        )
+    };
+    Errno::result(res)
+        .map(drop)
+        .map_err(|x| Box::new(x) as Box<dyn std::error::Error>)
 }
 
 /// Converts an int value to a ptrace Event enum.
@@ -198,8 +356,11 @@ fn get_destination_addr(pid: Pid, ins: &Insn, x86_oper: &X86OperandType)
     match *x86_oper {
         Imm(addr) => Ok(addr as usize),
         Mem(x86_op_mem) => {
-            let addr_location = x86_op_mem.disp() as usize;
-            let addr = read(pid, addr_location as *mut c_void)? as usize;
+            let addr_location = ins.address() as usize + x86_op_mem.disp() as usize;
+            let mut addr_buf = MaybeUninit::<[u8; 8]>::uninit();
+            // is this UB? :P
+            tracee_read(pid, addr_location, unsafe { &mut *addr_buf.as_mut_ptr() })?;
+            let addr = unsafe { transmute::<_, usize>(addr_buf) };
             Ok(addr)
         }
         _ => Err(Box::new(ToolError::AddressResolutionError(ins.address() as usize))),
@@ -385,195 +546,6 @@ fn analyze_regions(
         branch_addresses.capacity()
     );
     Ok((reachable_code, branch_addresses))
-}
-
-/// This doesn't work because of: https://github.com/rust-lang/rust/issues/43408
-fn tracee_write<T: Integer + Sized>(pid: Pid, addr: usize, value: T) -> Result<(), Box<dyn std::error::Error>> {
-    let value_buf = unsafe { transmute::<_, [u8; std::mem::size_of::<T>()]>(value) };
-    let to_write_size = std::mem::size_of::<T>();
-    let mut written_bytes = 0;
-    while written_bytes < to_write_size {
-        let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
-        debug_assert_eq!(
-            aligned_addr + addr % std::mem::size_of::<usize>(),
-            addr,
-            "Address alignment computed incorrectly"
-        );
-        let buf_offset = addr - aligned_addr;
-        let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
-        let mut buf = unsafe { transmute::<_, [u8; std::mem::size_of::<usize>()]>(read_word) };
-        while buf_offset < std::mem::size_of::<usize>() && written_bytes < to_write_size {
-            buf[buf_offset] = value_buf[written_bytes];
-            buf_offset += 1;
-            written_bytes += 1;
-        }
-        let write_word = unsafe { transmute::<_, usize>(buf) };
-        trace!(
-            "Overwriting word at address {:#x}: {:#018x} with {:#018x}",
-            aligned_addr,
-            read_word,
-            write_word
-        );
-        // This is tricky - although ptrace's signature says "void *data"
-        // POKEDATA accepts the word to write by value
-        write(pid, aligned_addr as *mut c_void, write_word as *mut c_void)?;
-        debug_assert_eq!(
-            unsafe { transmute::<_, [u8; std::mem::size_of::<usize>()]>(read(pid, aligned_addr as *mut c_void)?) },
-            buf,
-            "Read value is not equal to the written value"
-        );
-        addr += std::mem::size_of::<usize>() - (addr - aligned_addr);
-    }
-    Ok(())
-}
-
-/// This doesn't work because of: https://github.com/rust-lang/rust/issues/43408
-fn tracee_read<T: Sized + Integer>(pid: Pid, addr: usize) -> Result<T, Box<dyn std::error::Error>> {
-    let mut read_buf = MaybeUninit::<[u8; std::mem::size_of::<T>()]>::uninit();
-    let to_read_size = std::mem::size_of::<T>();
-    let mut read_bytes = 0;
-    while read_bytes < to_read_size {
-        let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
-        debug_assert_eq!(
-            aligned_addr + addr % std::mem::size_of::<usize>(),
-            addr,
-            "Address alignment computed incorrectly"
-        );
-        let buf_offset = addr - aligned_addr;
-        let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
-        let mut buf = unsafe { transmute::<_, [u8; std::mem::size_of::<usize>()]>(read_word) };
-        while buf_offset < std::mem::size_of::<usize>() && read_bytes < to_read_size {
-            read_buf[read_bytes] = buf[buf_offset];
-            buf_offset += 1;
-            read_bytes += 1;
-        }
-        trace!(
-            "Read word at address {:#x}: {:#018x}",
-            aligned_addr,
-            read_word
-        );
-        addr += std::mem::size_of::<usize>() - (addr - aligned_addr);
-    }
-    Ok(unsafe { transmute::<_, T>(read_buf) })
-}
-
-fn tracee_set_byte(pid: Pid, addr: usize, byte: u8) -> Result<(), Box<dyn std::error::Error>> {
-    let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
-    debug_assert_eq!(
-        aligned_addr + addr % std::mem::size_of::<usize>(),
-        addr,
-        "Address alignment computed incorrectly"
-    );
-    let buf_offset = addr - aligned_addr;
-    let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
-    let mut buf = read_word.to_ne_bytes();
-    buf[buf_offset] = byte;
-    let write_word = unsafe { transmute::<_, usize>(buf) };
-    trace!(
-        "Overwriting word at address {:#x}: {:#018x} with {:#018x}",
-        aligned_addr,
-        read_word,
-        write_word
-    );
-    // This is tricky - although ptrace's signature says "void *data"
-    // POKEDATA accepts the word to write by value
-    write(pid, aligned_addr as *mut c_void, write_word as *mut c_void)?;
-    debug_assert_eq!(
-        read(pid, aligned_addr as *mut c_void)?.to_ne_bytes(),
-        buf,
-        "Read value is not equal to the written value"
-    );
-    Ok(())
-}
-
-fn tracee_get_byte(pid: Pid, addr: usize) -> Result<u8, Box<dyn std::error::Error>> {
-    let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
-    let buf_offset = addr - aligned_addr;
-    let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
-    trace!(
-        "Read word at address {:#x}: {:#018x}",
-        aligned_addr,
-        read_word
-    );
-    Ok(read_word.to_ne_bytes()[buf_offset])
-}
-
-// TODO remove this when nix/libc starts supporting setregs/getregs for musl targets
-#[repr(C)]
-struct Registers {
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
-    pub rbp: u64,
-    pub rbx: u64,
-    pub r11: u64,
-    pub r10: u64,
-    pub r9: u64,
-    pub r8: u64,
-    pub rax: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub orig_rax: u64,
-    pub rip: u64,
-    pub cs: u64,
-    pub eflags: u64,
-    pub rsp: u64,
-    pub ss: u64,
-    pub fs_base: u64,
-    pub gs_base: u64,
-    pub ds: u64,
-    pub es: u64,
-    pub fs: u64,
-    pub gs: u64,
-}
-
-fn tracee_set_registers(pid: Pid, regs: &Registers) -> Result<(), Box<dyn std::error::Error>> {
-    trace!("Writing tracee {}'s registers", pid);
-    let res = unsafe {
-        libc::ptrace(
-            Request::PTRACE_SETREGS as RequestType,
-            libc::pid_t::from(pid),
-            ptr::null_mut::<c_void>(),
-            regs as *const _ as *const c_void,
-        )
-    };
-    Errno::result(res)
-        .map(drop)
-        .map_err(|x| Box::new(x) as Box<dyn std::error::Error>)
-}
-
-fn tracee_get_registers(pid: Pid) -> Result<Registers, Box<dyn std::error::Error>> {
-    trace!("Reading tracee {}'s registers", pid);
-    // TODO use MaybeUninit when it works for structs
-    let regs: Registers = unsafe { mem::uninitialized() };
-    let res = unsafe {
-        libc::ptrace(
-            Request::PTRACE_GETREGS as RequestType,
-            libc::pid_t::from(pid),
-            ptr::null_mut::<Registers>(),
-            &regs as *const _ as *const c_void,
-        )
-    };
-    Errno::result(res)?;
-    Ok(regs)
-}
-
-fn tracee_save_registers(pid: Pid, regs: &mut Registers) -> Result<(), Box<dyn std::error::Error>> {
-    trace!("Reading tracee {}'s registers", pid);
-    let res = unsafe {
-        libc::ptrace(
-            Request::PTRACE_GETREGS as RequestType,
-            libc::pid_t::from(pid),
-            ptr::null_mut::<Registers>(),
-            regs as *const _ as *const c_void,
-        )
-    };
-    Errno::result(res)
-        .map(drop)
-        .map_err(|x| Box::new(x) as Box<dyn std::error::Error>)
 }
 
 const TRAP_X86: u8 = 0xCC;
