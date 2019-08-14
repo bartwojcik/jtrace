@@ -1,5 +1,7 @@
 use core::borrow::Borrow;
 use std::{mem, ptr};
+use std::cmp::{max, min};
+use std::cmp::Ordering::{Equal, Greater, Less};
 use std::collections::HashMap;
 use std::collections::vec_deque::VecDeque;
 use std::error::Error;
@@ -39,33 +41,24 @@ use InstructionType::*;
 #[derive(Debug)]
 pub enum ToolError {
     ArchitectureNotSupported,
-    AddressOutsideRegion(usize),
     InvalidInstruction(usize),
+    AddressOutsideRegion(usize),
     AddressResolutionError(usize),
 }
+
+impl Error for ToolError {}
 
 impl fmt::Display for ToolError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             ToolError::ArchitectureNotSupported => f.write_str("ArchitectureNotSupported"),
-            ToolError::AddressOutsideRegion(addr) => f.write_str(&format!("AddressOutsideRegion({})", addr)),
             ToolError::InvalidInstruction(addr) => f.write_str(&format!("InvalidInstruction({})", addr)),
+            ToolError::AddressOutsideRegion(addr) => f.write_str(&format!("AddressOutsideRegion({})", addr)),
             ToolError::AddressResolutionError(addr) => f.write_str(&format!("AddressResolutionError({})", addr)),
         }
     }
 }
 
-impl Error for ToolError {
-    fn description(&self) -> &str {
-        match *self {
-            ToolError::ArchitectureNotSupported => "Architecture not supported",
-            ToolError::AddressOutsideRegion(_) =>
-                "Address is outside of the memory region being analyzed - case not yet supported",
-            ToolError::InvalidInstruction(_) => "Invalid instruction detected",
-            ToolError::AddressResolutionError(_) => "Could not resolve the jump or call destination address",
-        }
-    }
-}
 
 #[derive(StructOpt)]
 /// Trace the execution path of a program.
@@ -98,16 +91,15 @@ fn tracee_read(pid: Pid, mut addr: usize, contents: &mut [u8])
         let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
         debug_assert_eq!(aligned_addr + addr % std::mem::size_of::<usize>(), addr,
                          "Address alignment computed incorrectly");
-        trace!("Reading byte at {:#x} by reading word at {:#x}", addr, aligned_addr);
         let mut buf_offset = addr - aligned_addr;
         let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
         let buf = unsafe { transmute::<_, [u8; std::mem::size_of::<usize>()]>(read_word) };
+        trace!("Read word at address {:#x}: {:#018x} (LE)", aligned_addr, read_word);
         while buf_offset < std::mem::size_of::<usize>() && read_bytes < to_read_size {
             contents[read_bytes] = buf[buf_offset];
             buf_offset += 1;
             read_bytes += 1;
         }
-        trace!("Read word at address {:#x}: {:#018x}", aligned_addr, read_word);
         addr += std::mem::size_of::<usize>() - (addr - aligned_addr);
     }
     Ok(())
@@ -149,7 +141,7 @@ fn tracee_write(pid: Pid, mut addr: usize, contents: &[u8])
             written_bytes += 1;
         }
         let write_word = unsafe { transmute::<_, usize>(buf) };
-        trace!("Overwriting word at address {:#x}: {:#018x} with {:#018x}",
+        trace!("Overwriting word at address {:#x}: {:#018x} (LE) with {:#018x} (LE)",
                aligned_addr, read_word, write_word);
         // This is tricky - although ptrace's signature says "void *data"
         // POKEDATA accepts the word to write by value
@@ -268,7 +260,7 @@ fn get_memory_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Err
         "Retrieved \"{}\" as the tracee {}'s original first command line argument",
         original_cmd, pid
     );
-    let mut code_maps_with_buffers: Vec<_> = maps
+    let mut memory_maps_with_buffers: Vec<_> = maps
         .into_iter()
         .filter(|map| {
             trace!(
@@ -296,12 +288,12 @@ fn get_memory_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Err
         .collect();
     debug!(
         "Allocated {} buffers for tracee {}'s memory regions",
-        code_maps_with_buffers.len(),
+        memory_maps_with_buffers.len(),
         pid
     );
-    let mut local_iov = Vec::<IoVec<&mut [u8]>>::with_capacity(code_maps_with_buffers.len());
-    let mut remote_iov = Vec::<RemoteIoVec>::with_capacity(code_maps_with_buffers.len());
-    for (map, buf) in code_maps_with_buffers.iter_mut() {
+    let mut local_iov = Vec::<IoVec<&mut [u8]>>::with_capacity(memory_maps_with_buffers.len());
+    let mut remote_iov = Vec::<RemoteIoVec>::with_capacity(memory_maps_with_buffers.len());
+    for (map, buf) in memory_maps_with_buffers.iter_mut() {
         local_iov.push(IoVec::from_mut_slice(buf.as_mut_slice()));
         remote_iov.push(RemoteIoVec {
             base: map.start(),
@@ -310,16 +302,16 @@ fn get_memory_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Err
     }
     let bytes_read = process_vm_readv(pid, local_iov.as_slice(), remote_iov.as_slice())?;
     debug!("Read {} bytes of the tracee {}'s memory", bytes_read, pid);
-    if bytes_read != code_maps_with_buffers.iter().map(|(m, _b)| m.size()).sum() {
+    if bytes_read != memory_maps_with_buffers.iter().map(|(m, _b)| m.size()).sum() {
         warn!("process_vm_readv bytes read return value does not match expected value, continuing");
         debug_assert!(false);
     }
-    code_maps_with_buffers.sort_unstable_by_key(|(map, _buf)| map.start());
-    Ok(code_maps_with_buffers)
+    memory_maps_with_buffers.sort_unstable_by_key(|(map, _buf)| map.start());
+    Ok(memory_maps_with_buffers)
 }
 
-fn region_for_address(addr: usize, code_regions: &MemoryRegions) -> Option<&MemoryRegion> {
-    for region in code_regions {
+fn region_for_address(addr: usize, memory_regions: &MemoryRegions) -> Option<&MemoryRegion> {
+    for region in memory_regions {
         if addr > region.0.start() && addr < region.0.start() + region.0.size() {
             return Some(region);
         }
@@ -334,8 +326,6 @@ const RET_GROUP: u8 = 3;
 const IRET_GROUP: u8 = 5;
 //const BRANCH_RELATIVE_GROUP: u8 = 7;
 
-const JMP_OPCODES: [u8; 3] = [0xffu8, 0xe9u8, 0xebu8];
-
 fn is_group(detail: &InsnDetail, group_id: u8) -> bool {
     detail.groups().filter(|g| g.0 == group_id).count() == 1
 }
@@ -344,6 +334,8 @@ fn is_ret(detail: &InsnDetail) -> bool {
     detail.groups().filter(|g| g.0 == RET_GROUP || g.0 == IRET_GROUP).count() > 0
 }
 
+const JMP_OPCODES: [u8; 3] = [0xffu8, 0xe9u8, 0xebu8];
+
 fn is_unconditional_branch(detail: &InsnDetail, arch_detail: &ArchDetail) -> bool {
     let opcode = arch_detail.x86().unwrap().opcode()[0];
     let jmp_opcode =
@@ -351,12 +343,20 @@ fn is_unconditional_branch(detail: &InsnDetail, arch_detail: &ArchDetail) -> boo
     return is_group(detail, JUMP_GROUP) && jmp_opcode;
 }
 
+fn is_conditional_branch(detail: &InsnDetail, arch_detail: &ArchDetail) -> bool {
+    let opcode = arch_detail.x86().unwrap().opcode()[0];
+    let jmp_opcode =
+        opcode == JMP_OPCODES[0] || opcode == JMP_OPCODES[1] || opcode == JMP_OPCODES[2];
+    return is_group(detail, JUMP_GROUP) && !jmp_opcode;
+}
+
 fn get_destination_addr(pid: Pid, ins: &Insn, x86_oper: &X86OperandType)
                         -> Result<usize, Box<dyn std::error::Error>> {
     match *x86_oper {
         Imm(addr) => Ok(addr as usize),
         Mem(x86_op_mem) => {
-            let addr_location = ins.address() as usize + x86_op_mem.disp() as usize;
+            // TODO handle ljmp correctly
+            let addr_location = ins.address() as usize + ins.bytes().len() + x86_op_mem.disp() as usize;
             let mut addr_buf = MaybeUninit::<[u8; 8]>::uninit();
             // is this UB? :P
             tracee_read(pid, addr_location, unsafe { &mut *addr_buf.as_mut_ptr() })?;
@@ -376,14 +376,28 @@ enum InstructionType<'a> {
 
 /// Checks if the given instruction is a unconditional jump, branch or a call.
 fn analyze_instruction<'a>(
-    _ins: &Insn,
+    ins: &Insn,
     detail: &InsnDetail,
     arch_detail: &ArchDetail,
     ops: &'a Vec<ArchOperand>,
+    cs: &Capstone,
 ) -> InstructionType<'a> {
+    let group_names = Vec::from_iter(detail.groups()
+        .map(|g| cs.group_name(g).unwrap_or("".to_string())));
+    trace!("\t{:#x}\t{} {}\t\tGroups:{:?}",
+           ins.address(),
+           ins.mnemonic().unwrap_or(""),
+           ins.op_str().unwrap_or(""),
+           group_names);
+//    for (i, op) in ops.iter().enumerate() {
+//        if let X86Operand(x86_operand) = op {
+//            trace!("\t\t[Operand {}: {:?} (size: {})]", i, x86_operand.op_type, x86_operand.size);
+//        }
+//    }
+    // TODO try to tackle non-immediate cases (e.g. jmp rax, jmp qword ptr [rax]?)
+    // TODO handle rip manipulation as a jump?
     if ops.len() == 1 {
         if let X86Operand(x86_operand) = &ops[0] {
-            // TODO try to tackle non-immediate cases (e.g. jmp rax, jmp qword ptr [rax]?)
             let jump_operand = &x86_operand.op_type;
             if is_group(detail, JUMP_GROUP) {
                 if is_unconditional_branch(detail, arch_detail) {
@@ -399,17 +413,163 @@ fn analyze_instruction<'a>(
     Normal
 }
 
-const INITIAL_REACHABE_CODE_CAPACITY: usize = 4096;
+fn get_entrypoint(
+    _pid: Pid,
+    memory_regions: &MemoryRegions,
+    _cs: &Capstone,
+) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+    // TODO handle case when the header is not loaded into memory
+    for (_map, buf) in memory_regions {
+        for (loc, w) in buf.windows(xmas_elf::header::MAGIC.len()).enumerate() {
+            if w == xmas_elf::header::MAGIC {
+                if let Ok(header) = xmas_elf::header::parse_header(&buf[loc..]) {
+                    if let xmas_elf::header::HeaderPt2::Header64(h64) = header.pt2 {
+                        return Ok(Some(h64.entry_point as usize));
+                    };
+                }
+            }
+        }
+    }
+    Ok(None)
+}
 
-/// Entries have form: (address, block length)
-type ReachableCode = Vec<(usize, u32)>;
+const MOV_ID: InsnIdInt = 449;
+const RDI_ID: RegIdInt = 39;
+const HLT_ID: InsnIdInt = 208;
+
+fn find_main_address(
+    _pid: Pid,
+    entrypoint: Option<usize>,
+    memory_regions: &MemoryRegions,
+    cs: &Capstone,
+) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+    // TODO support non-glibc binaries
+    // TODO support non-x86_64 binaries
+    // maybe extract from symbol table? what if binary is stripped?
+    if let Some(entrypoint) = entrypoint {
+        trace!("Searching for main at {:#x}", entrypoint);
+        if let Some((map, buf)) = region_for_address(entrypoint, memory_regions) {
+            // decode instructions until mov rdi
+            let mut addr = entrypoint;
+            'o: loop {
+                let buf_offset = addr - map.start();
+                let insns = cs.disasm_count(&buf[buf_offset..buf_offset + X86_MAX_INSTR_LEN],
+                                            addr as u64, 1)?;
+                if insns.is_empty() {
+                    break 'o;
+                }
+                for ins in insns.iter() {
+                    let detail = cs.insn_detail(&ins)?;
+                    let arch_detail = detail.arch_detail();
+                    let ops = arch_detail.operands();
+                    if ins.id().0 == HLT_ID {
+                        break 'o;
+                    }
+                    if ins.id().0 == MOV_ID && ops.len() == 2 {
+                        if let (X86Operand(x86_op_1), X86Operand(x86_op_2)) = (&ops[0], &ops[1]) {
+                            if let (Reg(reg_id), Imm(main_addr)) =
+                            (&x86_op_1.op_type, &x86_op_2.op_type) {
+                                if reg_id.0 == RDI_ID {
+                                    return Ok(Some(*main_addr as usize))
+                                }
+                            }
+                        }
+                    }
+                    addr += ins.bytes().len();
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+const INITIAL_REACHABE_CODE_CAPACITY: usize = 4096;
+const INITIAL_XREFS_CAPACITY: usize = 16384;
+
+// TODO change to Xrefs Vec<usize, usize>, or alternatively - a map?
+type Addresses = Vec<usize>;
+/// Entries have form: (start address, end address))
+type ReachableCode = Vec<(usize, usize)>;
 /// Entries have form: (address, instruction length)
 type BranchAddresses = Vec<(usize, u8)>;
+
+fn seek_xrefs(
+    pid: Pid,
+    memory_regions: &MemoryRegions,
+    cs: &Capstone,
+) -> Result<Addresses, Box<dyn std::error::Error>> {
+    let mut dst_addrs = Addresses::with_capacity(INITIAL_XREFS_CAPACITY);
+    for (map, buf) in memory_regions {
+        trace!("Seeking xrefs in memory region: {:#?}", map);
+        let mut addr = map.start();
+        while addr < map.start() + map.size() {
+            let buf_offset = addr - map.start();
+            let insns = cs.disasm_all(&buf[buf_offset..], addr as u64)?;
+            if insns.is_empty() {
+                addr += 1;
+                continue;
+            }
+            for ins in insns.iter() {
+                let detail = cs.insn_detail(&ins)?;
+                let arch_detail = detail.arch_detail();
+                let ops = arch_detail.operands();
+                let ins_type = analyze_instruction(&ins, &detail, &arch_detail, &ops, cs);
+
+                match ins_type {
+                    Normal => (),
+                    Call(x86_op) | ConditionalJump(x86_op) | UnconditionalJump(x86_op) => {
+                        let dst_addr = match get_destination_addr(pid, &ins, &x86_op) {
+                            Ok(dst_addr) => dst_addr,
+                            Err(e) => {
+                                warn!("Error when getting destination address at {:x}: {}",
+                                      addr, e);
+                                addr += ins.bytes().len();
+                                continue;
+                            }
+                        };
+                        // if it is a jump or a call to an executable region
+                        // then treat it as a valid address
+                        if let Some((map, _buf)) = region_for_address(dst_addr, memory_regions) {
+                            if map.is_exec() {
+                                trace!("xref from {:#x} to {:#x}", ins.address(), dst_addr);
+                                dst_addrs.push(dst_addr);
+                            }
+                        }
+                    }
+                }
+                addr += ins.bytes().len();
+            }
+        }
+    }
+    debug!("Gathered {} xrefs", dst_addrs.len());
+    Ok(dst_addrs)
+}
+
+fn add_code_block(start: usize, end: usize, reachable_code: &mut ReachableCode) {
+    let comparator = |probe: &(usize, usize)| {
+        if end < probe.0 {
+            Less
+        } else if start > probe.1 {
+            Greater
+        } else {
+            Equal
+        }
+    };
+    match reachable_code.binary_search_by(comparator) {
+        Ok(i) => {
+            reachable_code[i].0 = min(start, reachable_code[i].0);
+            reachable_code[i].1 = max(end, reachable_code[i].1);
+        }
+        Err(i) => {
+            reachable_code.insert(i, (start, end));
+        }
+    }
+}
 
 fn analyze_block(
     pid: Pid,
     start: usize,
-    code_regions: &MemoryRegions,
+    memory_regions: &MemoryRegions,
     processed: &mut HashMap<usize, bool, BuildHasherDefault<AHasher>>,
     reachable_code: &mut ReachableCode,
     branch_addresses: &mut BranchAddresses,
@@ -419,7 +579,7 @@ fn analyze_block(
     if let Some(&value) = processed.get(&start) {
         result = value;
     } else {
-        result = analyze_block_uncached(pid, start, code_regions, processed, reachable_code,
+        result = analyze_block_uncached(pid, start, memory_regions, processed, reachable_code,
                                         branch_addresses, cs)?;
         processed.insert(start, result);
     }
@@ -429,14 +589,15 @@ fn analyze_block(
 fn analyze_block_uncached(
     pid: Pid,
     start: usize,
-    code_regions: &MemoryRegions,
+    memory_regions: &MemoryRegions,
     processed: &mut HashMap<usize, bool, BuildHasherDefault<AHasher>>,
     reachable_code: &mut ReachableCode,
     branch_addresses: &mut BranchAddresses,
     cs: &Capstone,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if let Some((map, buf)) = region_for_address(start, code_regions) {
+    if let Some((map, buf)) = region_for_address(start, memory_regions) {
         trace!("Analyzing block at {:#x}", start);
+        let mut branch_addresses_buf = BranchAddresses::new();
         let mut addr = start;
         loop {
             // assume that the instruction does not cross region boundary
@@ -445,61 +606,45 @@ fn analyze_block_uncached(
                 cs.disasm_count(&buf[addr - map.start()..addr - map.start() + X86_MAX_INSTR_LEN],
                                 addr as u64, 1)?;
             if insns.is_empty() {
-                return Err(Box::new(ToolError::InvalidInstruction(addr)));
+                warn!("Invalid instruction detected at {:#x}, ignoring block", addr);
+                return Ok(false);
             } else {
                 for ins in insns.iter() {
                     let detail = cs.insn_detail(&ins)?;
-                    let group_names = Vec::from_iter(detail.groups()
-                        .map(|g| cs.group_name(g).unwrap_or("".to_string())));
-                    trace!("\t{:#x}\t{} {}\t\tGroups:{:?}",
-                           ins.address(),
-                           ins.mnemonic().unwrap_or(""),
-                           ins.op_str().unwrap_or(""),
-                           group_names);
                     let arch_detail = detail.arch_detail();
                     let ops = arch_detail.operands();
-                    for (i, op) in ops.iter().enumerate() {
-                        if let X86Operand(x86_operand) = op {
-                            trace!("\t\t[Operand {}: {:?}]", i, x86_operand)
-                        }
-                    }
                     if is_ret(&detail) {
                         // ret means we have reached the end of the code block
-                        reachable_code.push((start, (addr - start) as u32));
+                        branch_addresses.extend_from_slice(&branch_addresses_buf);
+                        add_code_block(start, addr, reachable_code);
+                        trace!("Block at {:#x} returns", start);
                         return Ok(true);
                     }
                     // TODO detect endless loops and exit syscall
-                    let analyzed = analyze_instruction(&ins, &detail, &arch_detail, &ops);
-                    match analyzed {
-                        UnconditionalJump(addr_op) => {
-                            let target_addr = get_destination_addr(pid, &ins, &addr_op)?;
-                            trace!("Jump detected at {:#x} to {:#x}", addr, target_addr);
-                            // TODO handle these compilcated cases in a more robust way
-                            if let Mem(_) = addr_op {
-                                analyze_block(pid, target_addr, code_regions, processed,
-                                              reachable_code, branch_addresses,
-                                              cs)?;
-                                reachable_code.push((start, (addr - start) as u32));
-                                return Ok(false);
-                            }
+                    match analyze_instruction(&ins, &detail, &arch_detail, &ops, cs) {
+                        UnconditionalJump(_) => {
+                            branch_addresses.extend_from_slice(&branch_addresses_buf);
+                            add_code_block(start, addr, reachable_code);
+                            return Ok(false);
                         }
-                        ConditionalJump(addr_op) => {
-                            let target_addr = get_destination_addr(pid, &ins, &addr_op)?;
-                            trace!("Branch detected at {:#x} to {:#x}", addr, target_addr);
-                            branch_addresses.push((addr, ins.bytes().len() as u8));
+                        ConditionalJump(_) => {
+                            branch_addresses_buf.push((addr, ins.bytes().len() as u8));
                         }
                         Call(addr_op) => {
                             let target_addr = get_destination_addr(pid, &ins, &addr_op)?;
-                            trace!("Call detected at {:#x} to {:#x}", addr, target_addr);
-                            let returns = analyze_block(pid, target_addr, code_regions, processed,
-                                                        reachable_code, branch_addresses,
-                                                        cs)?;
+                            let _returns = analyze_block(pid, target_addr, memory_regions,
+                                                         processed, reachable_code,
+                                                         branch_addresses, cs)?;
+                            // for now, assume all calls return
+                            // TODO handle calls that do not return (have to handle plt first)
                             // call that does not return means we have reached
                             // the end of the code block
-                            if !returns {
-                                reachable_code.push((start, (addr - start) as u32));
-                                return Ok(false);
-                            }
+//                            if !returns {
+//                                branch_addresses.extend_from_slice(&branch_addresses_buf);
+//                                add_code_block(start, addr, reachable_code);
+//                                return Ok(false);
+//                            }
+                            trace!("Back to analyzing block at {:#x}", start);
                         }
                         Normal => (),
                     }
@@ -508,15 +653,16 @@ fn analyze_block_uncached(
             }
         }
     } else {
-        // TODO do not assume that calls to outer regions always return
-        trace!("Skipping analysis at {:#x}, assume that it returns", start);
+        // TODO
+        trace!("Skipping analysis at {:#x}", start);
+        // assume that it returns
         Ok(true)
     }
 }
 
-fn analyze_regions(
+fn analyze(
     pid: Pid,
-    code_regions: &MemoryRegions,
+    memory_regions: &MemoryRegions,
     cs: &Capstone,
 ) -> Result<(ReachableCode, BranchAddresses), Box<dyn std::error::Error>> {
     let mut reachable_code = Vec::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
@@ -525,18 +671,25 @@ fn analyze_regions(
         INITIAL_REACHABE_CODE_CAPACITY,
         BuildHasherDefault::<AHasher>::default(),
     );
-    for (map, buf) in code_regions {
-        trace!("Analyzing code region: {:#?}", map);
-        let header = xmas_elf::header::parse_header(buf)?;
-        // TODO handle case when the header is not present in this region?
-        let entrypoint: usize = if let xmas_elf::header::HeaderPt2::Header64(h64) = header.pt2 {
-            h64.entry_point as usize
-        } else {
-            return Err(Box::new(ToolError::ArchitectureNotSupported));
-        };
-        // by specially crafting the assembly, it is easy to fool this procedure
-        analyze_block(pid, entrypoint, code_regions, &mut processed, &mut reachable_code,
+    info!("Seeking xrefs");
+    let mut xrefs = seek_xrefs(pid, memory_regions, cs)?;
+    let entrypoint = get_entrypoint(pid, memory_regions, cs)?;
+    if let Some(entrypoint) = entrypoint {
+        debug!("Entrypoint located at: {:#x}", entrypoint);
+        xrefs.push(entrypoint);
+    }
+    if let Some(main_addr) = find_main_address(pid, entrypoint, memory_regions, cs)? {
+        debug!("Main located at: {:#x}", main_addr);
+        xrefs.push(main_addr);
+    }
+    info!("Analyze blocks");
+    for addr in xrefs {
+        analyze_block(pid, addr, memory_regions, &mut processed, &mut reachable_code,
                       &mut branch_addresses, cs)?;
+    }
+    trace!("Detected reachable code:");
+    for (start, end) in reachable_code.iter() {
+        trace!("From {:#x} to {:#x}", start, end);
     }
     branch_addresses.sort_unstable_by_key(|s| s.0);
     branch_addresses.dedup_by_key(|s| s.0);
@@ -545,6 +698,9 @@ fn analyze_regions(
         branch_addresses.len(),
         branch_addresses.capacity()
     );
+    for (addr, size) in branch_addresses.iter() {
+        trace!("Branch at {:#x} (len {})", addr, size);
+    }
     Ok((reachable_code, branch_addresses))
 }
 
@@ -571,13 +727,13 @@ type ExecutionPathLog = VecDeque<ExecutionPathEntry>;
 fn handle_trap(
     pid: Pid,
     jump_addresses: &BranchAddresses,
-    code_regions: &MemoryRegions,
+    memory_regions: &MemoryRegions,
     execution_log: &mut ExecutionPathLog,
 ) -> Result<Pid, Box<dyn std::error::Error>> {
     let mut regs = tracee_get_registers(pid)?;
     let trap_addr = (regs.rip - 1) as usize;
     if let Ok(orig_instr_loc) = jump_addresses.binary_search_by_key(&trap_addr, |s| s.0) {
-        let region = region_for_address(trap_addr, code_regions).unwrap();
+        let region = region_for_address(trap_addr, memory_regions).unwrap();
         let region_offset = trap_addr - region.0.start();
         trace!(
             "Removing a trap at {:#x} in tracee {}'s memory",
@@ -602,10 +758,10 @@ fn handle_trap(
             let orig_instr_size = jump_addresses[orig_instr_loc].1;
             if regs.rip as usize == trap_addr + orig_instr_size as usize {
                 execution_log.push_back((pid, trap_addr, false));
-                trace!("Branch at {:#x} not taken by {}!", trap_addr, pid);
+                trace!("Branch at {:#x} not taken by {}", trap_addr, pid);
             } else {
                 execution_log.push_back((pid, trap_addr, true));
-                trace!("Branch at {:#x} taken by {}!", trap_addr, pid);
+                trace!("Branch at {:#x} taken by {}", trap_addr, pid);
             }
         } else {
             warn!(
@@ -626,7 +782,7 @@ fn handle_trap(
 fn trace(
     _pid: Pid,
     jump_addresses: &BranchAddresses,
-    code_regions: &MemoryRegions,
+    memory_regions: &MemoryRegions,
     execution_log: &mut ExecutionPathLog,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut traced_processes = 1;
@@ -677,7 +833,7 @@ fn trace(
                     SIGTRAP => Some(handle_trap(
                         pid,
                         jump_addresses,
-                        code_regions,
+                        memory_regions,
                         execution_log,
                     )?),
                     // TODO handle every signal properly
@@ -735,7 +891,7 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
     setoptions(child_pid, ptrace_options)?;
     trace!("Set tracing options for tracee {}", child_pid);
     // TODO handle case with code being loaded dynamically in runtime (plugins)
-    let code_regions = get_memory_regions(child_pid)?;
+    let memory_regions = get_memory_regions(child_pid)?;
     // TODO what about 32-bit mode?
     let cs_x86 = Capstone::new()
         .x86()
@@ -744,13 +900,13 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .detail(true)
         .build()?;
     trace!("Created capstone object");
-    let (_reachable_code, jump_addresses) = analyze_regions(child_pid, &code_regions, &cs_x86)?;
+    let (_reachable_code, jump_addresses) = analyze(child_pid, &memory_regions, &cs_x86)?;
     set_branch_breakpoints(child_pid, &jump_addresses)?;
     let mut execution_log = ExecutionPathLog::with_capacity(INITIAL_EXECUTION_LOG_CAPACITY);
     trace(
         child_pid,
         &jump_addresses,
-        &code_regions,
+        &memory_regions,
         &mut execution_log,
     )
     // TODO remove breakpoints after canceling tracer for attach pid mode
