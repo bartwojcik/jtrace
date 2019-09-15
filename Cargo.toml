@@ -10,12 +10,16 @@ edition = "2018"
 
 [dependencies]
 ahash = "0.2.4"
+bincode = "1.1.4"
 capstone = "0.6.0"
 clap = "2.33.0"
+crossbeam = "0.7.2"
 env_logger = "0.6.1"
 libc = "0.2.54"
 log = "0.4.6"
 nix = "0.13.0"
 proc-maps = "0.1.5"
+serde = { version = "1.0.100", features = ["derive"] }
+spsc-bip-buffer = "0.2.1"
 structopt = "0.2.15"
 xmas-elf = "0.7.0"

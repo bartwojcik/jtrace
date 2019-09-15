@@ -3,19 +3,24 @@ use std::{mem, ptr};
 use std::cmp::{max, min};
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::collections::HashMap;
-use std::collections::vec_deque::VecDeque;
+use std::env::args;
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
-use std::fs::read_to_string;
+use std::fs::{File, read_to_string};
 use std::hash::BuildHasherDefault;
+use std::io::BufWriter;
 use std::io::Error as IoError;
+use std::io::Write;
 use std::iter::FromIterator;
 use std::mem::{MaybeUninit, transmute};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::thread;
+use std::thread::JoinHandle;
 
 use ahash::AHasher;
+use bincode::{serialize, serialize_into};
 use capstone::arch::ArchOperand;
 use capstone::arch::ArchOperand::X86Operand;
 use capstone::arch::x86::X86OperandType;
@@ -24,6 +29,7 @@ use capstone::Insn;
 use capstone::prelude::*;
 use clap;
 use libc;
+use libc::pid_t;
 use log::{debug, error, info, trace, warn};
 use nix::errno::Errno;
 use nix::sys::ptrace::{
@@ -34,9 +40,13 @@ use nix::sys::uio::{IoVec, process_vm_readv, RemoteIoVec};
 use nix::sys::wait::{wait, waitpid, WaitStatus};
 use nix::unistd::Pid;
 use proc_maps::{get_process_maps, MapRange};
+use serde::{Deserialize, Serialize};
+use spsc_bip_buffer::{bip_buffer_with_len, BipBufferWriter};
 use structopt::StructOpt;
 
 use InstructionType::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub enum ToolError {
@@ -60,7 +70,7 @@ impl fmt::Display for ToolError {
 }
 
 
-#[derive(StructOpt)]
+#[derive(StructOpt, Serialize, Deserialize)]
 /// Trace the execution path of a program.
 struct Cli {
     /// PID of the process to attach to
@@ -470,7 +480,7 @@ fn find_main_address(
                             if let (Reg(reg_id), Imm(main_addr)) =
                             (&x86_op_1.op_type, &x86_op_2.op_type) {
                                 if reg_id.0 == RDI_ID {
-                                    return Ok(Some(*main_addr as usize))
+                                    return Ok(Some(*main_addr as usize));
                                 }
                             }
                         }
@@ -720,9 +730,70 @@ fn set_branch_breakpoints(
     Ok(())
 }
 
-// TODO this should be more sophisticated
-type ExecutionPathEntry = (Pid, usize, bool);
-type ExecutionPathLog = VecDeque<ExecutionPathEntry>;
+
+#[derive(Serialize, Deserialize)]
+struct ExecutionPathHeader {
+    pid: pid_t,
+    args: Vec<String>,
+}
+
+const LOG_BIP_BUFFER_SIZE: usize = 16384;
+
+struct ExecutionPathLog {
+    writer: BipBufferWriter,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ExecutionPathLog {
+    fn new(pid: Pid) -> Result<Self, Box<dyn std::error::Error>> {
+        let header = ExecutionPathHeader { pid: pid.as_raw(), args: args().collect() };
+        let mut buf_file = BufWriter::new(File::create(format!("{}.jtrace",
+                                                               pid.as_raw().to_string()))?);
+        serialize_into(&mut buf_file, &header)?;
+        // create a bipbuffer
+        let (writer, mut reader) = bip_buffer_with_len(LOG_BIP_BUFFER_SIZE);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        // spawn a thread
+        let handle = thread::spawn(move || {
+            loop {
+                let len;
+                {
+                    let valid = reader.valid();
+                    len = valid.len();
+                    // TODO backoff if valid is empty
+                    buf_file.write(valid).unwrap();
+                }
+                reader.consume(len);
+                if stop_clone.load(Ordering::Relaxed) == true {
+                    break;
+                }
+            }
+        });
+        // create and return ExecutionPathLog
+        Ok(ExecutionPathLog { writer: writer, stop: stop, handle: Some(handle) })
+    }
+
+    fn write(&mut self, pid: Pid, address: usize, taken: bool) -> Result<(), Box<dyn std::error::Error>> {
+        // TODO this should be more sophisticated?
+        // pid, address, (branch) taken
+        //type ExecutionPathEntry = (pid_t, usize, bool);
+        let entry = (pid.as_raw(), address, taken);
+        let encoded = serialize(&entry)?;
+        let mut reservation = self.writer.spin_reserve(encoded.len());
+        reservation.copy_from_slice(&encoded[..]);
+        reservation.send();
+        Ok(())
+    }
+}
+
+impl Drop for ExecutionPathLog {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.handle.take().unwrap().join().unwrap();
+    }
+}
 
 fn handle_trap(
     pid: Pid,
@@ -757,10 +828,10 @@ fn handle_trap(
             tracee_save_registers(pid, &mut regs)?;
             let orig_instr_size = jump_addresses[orig_instr_loc].1;
             if regs.rip as usize == trap_addr + orig_instr_size as usize {
-                execution_log.push_back((pid, trap_addr, false));
+                execution_log.write(pid, trap_addr, false)?;
                 trace!("Branch at {:#x} not taken by {}", trap_addr, pid);
             } else {
-                execution_log.push_back((pid, trap_addr, true));
+                execution_log.write(pid, trap_addr, true)?;
                 trace!("Branch at {:#x} taken by {}", trap_addr, pid);
             }
         } else {
@@ -848,8 +919,6 @@ fn trace(
     }
 }
 
-const INITIAL_EXECUTION_LOG_CAPACITY: usize = 134_217_728;
-
 fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let child_pid: Pid;
     let mut ptrace_options = Options::empty();
@@ -902,7 +971,7 @@ fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
     trace!("Created capstone object");
     let (_reachable_code, jump_addresses) = analyze(child_pid, &memory_regions, &cs_x86)?;
     set_branch_breakpoints(child_pid, &jump_addresses)?;
-    let mut execution_log = ExecutionPathLog::with_capacity(INITIAL_EXECUTION_LOG_CAPACITY);
+    let mut execution_log = ExecutionPathLog::new(child_pid)?;
     trace(
         child_pid,
         &jump_addresses,
@@ -918,7 +987,7 @@ fn main() {
     let args = Cli::from_args();
     if let Err(top_e) = run(args) {
         error!("{}", top_e.to_string());
-        let mut e: &Error = top_e.borrow();
+        let mut e: &dyn Error = top_e.borrow();
         while let Some(source) = e.source() {
             error!("Caused by: {}", source.to_string());
             e = source;
