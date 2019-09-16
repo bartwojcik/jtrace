@@ -47,6 +47,7 @@ use structopt::StructOpt;
 use InstructionType::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use crossbeam::utils::Backoff;
 
 #[derive(Debug)]
 pub enum ToolError {
@@ -757,18 +758,27 @@ impl ExecutionPathLog {
         let stop_clone = stop.clone();
         // spawn a thread
         let handle = thread::spawn(move || {
+            let backoff = Backoff::new();
             loop {
                 let len;
                 {
                     let valid = reader.valid();
                     len = valid.len();
-                    // TODO backoff if valid is empty
+                    if len == 0 {
+                        // TODO backoff if valid is empty
+                        if backoff.is_completed() {
+                            thread::park();
+                        } else {
+                            backoff.snooze();
+                        }
+                        if stop_clone.load(Ordering::Relaxed) == true {
+                            break;
+                        }
+                        continue;
+                    }
                     buf_file.write(valid).unwrap();
                 }
                 reader.consume(len);
-                if stop_clone.load(Ordering::Relaxed) == true {
-                    break;
-                }
             }
         });
         // create and return ExecutionPathLog
@@ -784,6 +794,7 @@ impl ExecutionPathLog {
         let mut reservation = self.writer.spin_reserve(encoded.len());
         reservation.copy_from_slice(&encoded[..]);
         reservation.send();
+        self.handle.as_ref().unwrap().thread().unpark();
         Ok(())
     }
 }
@@ -791,6 +802,7 @@ impl ExecutionPathLog {
 impl Drop for ExecutionPathLog {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.handle.as_ref().unwrap().thread().unpark();
         self.handle.take().unwrap().join().unwrap();
     }
 }
