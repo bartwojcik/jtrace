@@ -1,92 +1,46 @@
-use core::borrow::Borrow;
-use std::{mem, ptr};
+use std::{mem, thread};
 use std::cmp::{max, min};
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::collections::HashMap;
 use std::env::args;
 use std::error::Error;
 use std::ffi::c_void;
-use std::fmt;
 use std::fs::{File, read_to_string};
 use std::hash::BuildHasherDefault;
 use std::io::BufWriter;
-use std::io::Error as IoError;
 use std::io::Write;
 use std::iter::FromIterator;
-use std::mem::{MaybeUninit, transmute};
-use std::os::unix::process::CommandExt;
-use std::process::Command;
-use std::thread;
+use std::mem::{MaybeUninit, size_of, transmute};
+use std::ptr::null_mut;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use ahash::AHasher;
 use bincode::{serialize, serialize_into};
+use capstone::{Capstone, Insn, InsnDetail, InsnIdInt, RegIdInt};
 use capstone::arch::ArchOperand;
 use capstone::arch::ArchOperand::X86Operand;
 use capstone::arch::x86::X86OperandType;
 use capstone::arch::x86::X86OperandType::*;
-use capstone::Insn;
 use capstone::prelude::*;
-use clap;
-use libc;
-use libc::pid_t;
+use crossbeam::utils::Backoff;
 use log::{debug, error, info, trace, warn};
 use nix::errno::Errno;
-use nix::sys::ptrace::{
-    attach, cont, Event, Options, read, Request, RequestType, setoptions, step, traceme, write,
-};
+use nix::sys::ptrace::{cont, Event, read, Request, RequestType, step, write};
 use nix::sys::signal::{SIGCHLD, SIGSTOP, SIGTRAP};
 use nix::sys::uio::{IoVec, process_vm_readv, RemoteIoVec};
 use nix::sys::wait::{wait, waitpid, WaitStatus};
 use nix::unistd::Pid;
 use proc_maps::{get_process_maps, MapRange};
-use serde::{Deserialize, Serialize};
 use spsc_bip_buffer::{bip_buffer_with_len, BipBufferWriter};
-use structopt::StructOpt;
 
 use InstructionType::*;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use crossbeam::utils::Backoff;
 
-#[derive(Debug)]
-pub enum ToolError {
-    ArchitectureNotSupported,
-    InvalidInstruction(usize),
-    AddressOutsideRegion(usize),
-    AddressResolutionError(usize),
-}
+use crate::common::{ExecutionPathEntry, ExecutionPathHeader, ToolError};
 
-impl Error for ToolError {}
-
-impl fmt::Display for ToolError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            ToolError::ArchitectureNotSupported => f.write_str("ArchitectureNotSupported"),
-            ToolError::InvalidInstruction(addr) => f.write_str(&format!("InvalidInstruction({})", addr)),
-            ToolError::AddressOutsideRegion(addr) => f.write_str(&format!("AddressOutsideRegion({})", addr)),
-            ToolError::AddressResolutionError(addr) => f.write_str(&format!("AddressResolutionError({})", addr)),
-        }
-    }
-}
-
-
-#[derive(StructOpt, Serialize, Deserialize)]
-/// Trace the execution path of a program.
-struct Cli {
-    /// PID of the process to attach to
-    #[structopt(short = "p", long = "pid")]
-    pid: Option<u32>,
-    /// Trace child processes as they are created by currently traced processes
-    #[structopt(short = "f", long = "follow")]
-    follow: bool,
-    /// The command to be executed
-    #[structopt(raw(multiple = "true"))]
-    command: Vec<String>,
-}
-
-fn tracee_get_byte(pid: Pid, addr: usize) -> Result<u8, Box<dyn std::error::Error>> {
-    let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
+fn tracee_get_byte(pid: Pid, addr: usize) -> Result<u8, Box<dyn Error>> {
+    let aligned_addr = addr / size_of::<usize>() * size_of::<usize>();
     let buf_offset = addr - aligned_addr;
     let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
     trace!("Read word at address {:#x}: {:#018x}", aligned_addr, read_word);
@@ -95,30 +49,30 @@ fn tracee_get_byte(pid: Pid, addr: usize) -> Result<u8, Box<dyn std::error::Erro
 
 /// signature is somewhat weird because of: https://github.com/rust-lang/rust/issues/43408
 fn tracee_read(pid: Pid, mut addr: usize, contents: &mut [u8])
-               -> Result<(), Box<dyn std::error::Error>> {
+               -> Result<(), Box<dyn Error>> {
     let to_read_size = contents.len();
     let mut read_bytes = 0;
     while read_bytes < to_read_size {
-        let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
-        debug_assert_eq!(aligned_addr + addr % std::mem::size_of::<usize>(), addr,
+        let aligned_addr = addr / size_of::<usize>() * size_of::<usize>();
+        debug_assert_eq!(aligned_addr + addr % size_of::<usize>(), addr,
                          "Address alignment computed incorrectly");
         let mut buf_offset = addr - aligned_addr;
         let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
-        let buf = unsafe { transmute::<_, [u8; std::mem::size_of::<usize>()]>(read_word) };
+        let buf = unsafe { transmute::<_, [u8; size_of::<usize>()]>(read_word) };
         trace!("Read word at address {:#x}: {:#018x} (LE)", aligned_addr, read_word);
-        while buf_offset < std::mem::size_of::<usize>() && read_bytes < to_read_size {
+        while buf_offset < size_of::<usize>() && read_bytes < to_read_size {
             contents[read_bytes] = buf[buf_offset];
             buf_offset += 1;
             read_bytes += 1;
         }
-        addr += std::mem::size_of::<usize>() - (addr - aligned_addr);
+        addr += size_of::<usize>() - (addr - aligned_addr);
     }
     Ok(())
 }
 
-fn tracee_set_byte(pid: Pid, addr: usize, byte: u8) -> Result<(), Box<dyn std::error::Error>> {
-    let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
-    debug_assert_eq!(aligned_addr + addr % std::mem::size_of::<usize>(), addr,
+fn tracee_set_byte(pid: Pid, addr: usize, byte: u8) -> Result<(), Box<dyn Error>> {
+    let aligned_addr = addr / size_of::<usize>() * size_of::<usize>();
+    debug_assert_eq!(aligned_addr + addr % size_of::<usize>(), addr,
                      "Address alignment computed incorrectly");
     let buf_offset = addr - aligned_addr;
     let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
@@ -136,17 +90,17 @@ fn tracee_set_byte(pid: Pid, addr: usize, byte: u8) -> Result<(), Box<dyn std::e
 }
 
 fn tracee_write(pid: Pid, mut addr: usize, contents: &[u8])
-                -> Result<(), Box<dyn std::error::Error>> {
+                -> Result<(), Box<dyn Error>> {
     let to_write_size = contents.len();
     let mut written_bytes = 0;
     while written_bytes < to_write_size {
-        let aligned_addr = addr / std::mem::size_of::<usize>() * std::mem::size_of::<usize>();
-        debug_assert_eq!(aligned_addr + addr % std::mem::size_of::<usize>(), addr,
+        let aligned_addr = addr / size_of::<usize>() * size_of::<usize>();
+        debug_assert_eq!(aligned_addr + addr % size_of::<usize>(), addr,
                          "Address alignment computed incorrectly");
         let mut buf_offset = addr - aligned_addr;
         let read_word = read(pid, aligned_addr as *mut c_void)? as usize;
-        let mut buf = unsafe { transmute::<_, [u8; std::mem::size_of::<usize>()]>(read_word) };
-        while buf_offset < std::mem::size_of::<usize>() && written_bytes < to_write_size {
+        let mut buf = unsafe { transmute::<_, [u8; size_of::<usize>()]>(read_word) };
+        while buf_offset < size_of::<usize>() && written_bytes < to_write_size {
             buf[buf_offset] = contents[written_bytes];
             buf_offset += 1;
             written_bytes += 1;
@@ -158,9 +112,9 @@ fn tracee_write(pid: Pid, mut addr: usize, contents: &[u8])
         // POKEDATA accepts the word to write by value
         write(pid, aligned_addr as *mut c_void, write_word as *mut c_void)?;
         debug_assert_eq!(
-            unsafe { transmute::<_, [u8; std::mem::size_of::<usize>()]>(read(pid, aligned_addr as *mut c_void)?) },
+            unsafe { transmute::<_, [u8; size_of::<usize>()]>(read(pid, aligned_addr as *mut c_void)?) },
             buf, "Read value is not equal to the written value");
-        addr += std::mem::size_of::<usize>() - (addr - aligned_addr);
+        addr += size_of::<usize>() - (addr - aligned_addr);
     }
     Ok(())
 }
@@ -197,22 +151,22 @@ struct Registers {
     pub gs: u64,
 }
 
-fn tracee_set_registers(pid: Pid, regs: &Registers) -> Result<(), Box<dyn std::error::Error>> {
+fn tracee_set_registers(pid: Pid, regs: &Registers) -> Result<(), Box<dyn Error>> {
     trace!("Writing tracee {}'s registers", pid);
     let res = unsafe {
         libc::ptrace(
             Request::PTRACE_SETREGS as RequestType,
             libc::pid_t::from(pid),
-            ptr::null_mut::<c_void>(),
+            null_mut::<c_void>(),
             regs as *const _ as *const c_void,
         )
     };
     Errno::result(res)
         .map(drop)
-        .map_err(|x| Box::new(x) as Box<dyn std::error::Error>)
+        .map_err(|x| Box::new(x) as Box<dyn Error>)
 }
 
-fn tracee_get_registers(pid: Pid) -> Result<Registers, Box<dyn std::error::Error>> {
+fn tracee_get_registers(pid: Pid) -> Result<Registers, Box<dyn Error>> {
     trace!("Reading tracee {}'s registers", pid);
     // TODO use MaybeUninit when it works for structs
     let regs: Registers = unsafe { mem::uninitialized() };
@@ -220,7 +174,7 @@ fn tracee_get_registers(pid: Pid) -> Result<Registers, Box<dyn std::error::Error
         libc::ptrace(
             Request::PTRACE_GETREGS as RequestType,
             libc::pid_t::from(pid),
-            ptr::null_mut::<Registers>(),
+            null_mut::<Registers>(),
             &regs as *const _ as *const c_void,
         )
     };
@@ -228,19 +182,19 @@ fn tracee_get_registers(pid: Pid) -> Result<Registers, Box<dyn std::error::Error
     Ok(regs)
 }
 
-fn tracee_save_registers(pid: Pid, regs: &mut Registers) -> Result<(), Box<dyn std::error::Error>> {
+fn tracee_save_registers(pid: Pid, regs: &mut Registers) -> Result<(), Box<dyn Error>> {
     trace!("Reading tracee {}'s registers", pid);
     let res = unsafe {
         libc::ptrace(
             Request::PTRACE_GETREGS as RequestType,
             libc::pid_t::from(pid),
-            ptr::null_mut::<Registers>(),
+            null_mut::<Registers>(),
             regs as *const _ as *const c_void,
         )
     };
     Errno::result(res)
         .map(drop)
-        .map_err(|x| Box::new(x) as Box<dyn std::error::Error>)
+        .map_err(|x| Box::new(x) as Box<dyn Error>)
 }
 
 /// Converts an int value to a ptrace Event enum.
@@ -262,7 +216,7 @@ fn int_to_ptrace_event(value: i32) -> Option<Event> {
 type MemoryRegion = (MapRange, Vec<u8>);
 type MemoryRegions = Vec<MemoryRegion>;
 
-fn get_memory_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn std::error::Error>> {
+pub fn get_memory_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn Error>> {
     let maps = get_process_maps(pid.as_raw())?;
     debug!("Read tracee {} memory maps from procfs", pid);
     let original_cmdline = read_to_string(format!("/proc/{}/cmdline", pid))?;
@@ -362,7 +316,7 @@ fn is_conditional_branch(detail: &InsnDetail, arch_detail: &ArchDetail) -> bool 
 }
 
 fn get_destination_addr(pid: Pid, ins: &Insn, x86_oper: &X86OperandType)
-                        -> Result<usize, Box<dyn std::error::Error>> {
+                        -> Result<usize, Box<dyn Error>> {
     match *x86_oper {
         Imm(addr) => Ok(addr as usize),
         Mem(x86_op_mem) => {
@@ -428,7 +382,7 @@ fn get_entrypoint(
     _pid: Pid,
     memory_regions: &MemoryRegions,
     _cs: &Capstone,
-) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+) -> Result<Option<usize>, Box<dyn Error>> {
     // TODO handle case when the header is not loaded into memory
     for (_map, buf) in memory_regions {
         for (loc, w) in buf.windows(xmas_elf::header::MAGIC.len()).enumerate() {
@@ -453,7 +407,7 @@ fn find_main_address(
     entrypoint: Option<usize>,
     memory_regions: &MemoryRegions,
     cs: &Capstone,
-) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+) -> Result<Option<usize>, Box<dyn Error>> {
     // TODO support non-glibc binaries
     // TODO support non-x86_64 binaries
     // maybe extract from symbol table? what if binary is stripped?
@@ -508,7 +462,7 @@ fn seek_xrefs(
     pid: Pid,
     memory_regions: &MemoryRegions,
     cs: &Capstone,
-) -> Result<Addresses, Box<dyn std::error::Error>> {
+) -> Result<Addresses, Box<dyn Error>> {
     let mut dst_addrs = Addresses::with_capacity(INITIAL_XREFS_CAPACITY);
     for (map, buf) in memory_regions {
         trace!("Seeking xrefs in memory region: {:#?}", map);
@@ -585,7 +539,7 @@ fn analyze_block(
     reachable_code: &mut ReachableCode,
     branch_addresses: &mut BranchAddresses,
     cs: &Capstone,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn Error>> {
     let result;
     if let Some(&value) = processed.get(&start) {
         result = value;
@@ -605,7 +559,7 @@ fn analyze_block_uncached(
     reachable_code: &mut ReachableCode,
     branch_addresses: &mut BranchAddresses,
     cs: &Capstone,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn Error>> {
     if let Some((map, buf)) = region_for_address(start, memory_regions) {
         trace!("Analyzing block at {:#x}", start);
         let mut branch_addresses_buf = BranchAddresses::new();
@@ -671,11 +625,11 @@ fn analyze_block_uncached(
     }
 }
 
-fn analyze(
+pub fn analyze(
     pid: Pid,
     memory_regions: &MemoryRegions,
     cs: &Capstone,
-) -> Result<(ReachableCode, BranchAddresses), Box<dyn std::error::Error>> {
+) -> Result<(ReachableCode, BranchAddresses), Box<dyn Error>> {
     let mut reachable_code = Vec::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
     let mut branch_addresses = Vec::with_capacity(INITIAL_REACHABE_CODE_CAPACITY);
     let mut processed = HashMap::<usize, bool, BuildHasherDefault<AHasher>>::with_capacity_and_hasher(
@@ -717,10 +671,10 @@ fn analyze(
 
 const TRAP_X86: u8 = 0xCC;
 
-fn set_branch_breakpoints(
+pub fn set_branch_breakpoints(
     pid: Pid,
     jump_addresses: &BranchAddresses,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     for (addr, _len) in jump_addresses {
         debug!(
             "Setting a trap instruction at {:#x} in tracee {}'s memory",
@@ -731,23 +685,16 @@ fn set_branch_breakpoints(
     Ok(())
 }
 
-
-#[derive(Serialize, Deserialize)]
-struct ExecutionPathHeader {
-    pid: pid_t,
-    args: Vec<String>,
-}
-
 const LOG_BIP_BUFFER_SIZE: usize = 16384;
 
-struct ExecutionPathLog {
+pub struct ExecutionPathLog {
     writer: BipBufferWriter,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl ExecutionPathLog {
-    fn new(pid: Pid) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(pid: Pid) -> Result<Self, Box<dyn Error>> {
         let header = ExecutionPathHeader { pid: pid.as_raw(), args: args().collect() };
         let mut buf_file = BufWriter::new(File::create(format!("{}.jtrace",
                                                                pid.as_raw().to_string()))?);
@@ -765,7 +712,6 @@ impl ExecutionPathLog {
                     let valid = reader.valid();
                     len = valid.len();
                     if len == 0 {
-                        // TODO backoff if valid is empty
                         if backoff.is_completed() {
                             thread::park();
                         } else {
@@ -785,11 +731,11 @@ impl ExecutionPathLog {
         Ok(ExecutionPathLog { writer: writer, stop: stop, handle: Some(handle) })
     }
 
-    fn write(&mut self, pid: Pid, address: usize, taken: bool) -> Result<(), Box<dyn std::error::Error>> {
+    fn write(&mut self, pid: Pid, address: usize, taken: bool) -> Result<(), Box<dyn Error>> {
         // TODO this should be more sophisticated?
         // pid, address, (branch) taken
-        //type ExecutionPathEntry = (pid_t, usize, bool);
-        let entry = (pid.as_raw(), address, taken);
+
+        let entry: ExecutionPathEntry = (pid.as_raw(), address, taken);
         let encoded = serialize(&entry)?;
         let mut reservation = self.writer.spin_reserve(encoded.len());
         reservation.copy_from_slice(&encoded[..]);
@@ -812,7 +758,7 @@ fn handle_trap(
     jump_addresses: &BranchAddresses,
     memory_regions: &MemoryRegions,
     execution_log: &mut ExecutionPathLog,
-) -> Result<Pid, Box<dyn std::error::Error>> {
+) -> Result<Pid, Box<dyn Error>> {
     let mut regs = tracee_get_registers(pid)?;
     let trap_addr = (regs.rip - 1) as usize;
     if let Ok(orig_instr_loc) = jump_addresses.binary_search_by_key(&trap_addr, |s| s.0) {
@@ -862,12 +808,12 @@ fn handle_trap(
     Ok(pid)
 }
 
-fn trace(
+pub fn trace(
     _pid: Pid,
     jump_addresses: &BranchAddresses,
     memory_regions: &MemoryRegions,
     execution_log: &mut ExecutionPathLog,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     let mut traced_processes = 1;
     loop {
         trace!("Tracer waiting");
@@ -927,82 +873,6 @@ fn trace(
         if let Some(pid) = waited_pid {
             trace!("Continuing PID {}", pid);
             cont(pid, None)?;
-        }
-    }
-}
-
-fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let child_pid: Pid;
-    let mut ptrace_options = Options::empty();
-    if args.follow {
-        ptrace_options |= Options::PTRACE_O_TRACEFORK
-            | Options::PTRACE_O_TRACEVFORK
-            | Options::PTRACE_O_TRACECLONE;
-    }
-    if let Some(pid) = args.pid {
-        // TODO support attaching to PID + all its current children with a flag?
-        child_pid = Pid::from_raw(pid as i32);
-        attach(child_pid)?;
-        info!("Attached to {}", child_pid);
-    } else if !args.command.is_empty() {
-        ptrace_options |= Options::PTRACE_O_EXITKILL;
-        // TODO implement passing user specified environment variables to the command
-        unsafe {
-            let child = Command::new(args.command.first().unwrap())
-                .args(&args.command[1..])
-                .pre_exec(|| {
-                    trace!("Child process initiating tracing");
-                    if traceme().is_err() {
-                        return Err(IoError::last_os_error());
-                    }
-                    Ok(())
-                })
-                .spawn()?;
-            child_pid = Pid::from_raw(child.id() as i32);
-        }
-        info!("Running {} attached in PID {}", args.command[0], child_pid);
-    } else {
-        // TODO implement this with structopt and panic here instead
-        return Err(Box::new(clap::Error::with_description(
-            "Either command or process PID must be given",
-            clap::ErrorKind::MissingRequiredArgument,
-        )));
-    }
-    let ptrace_options = ptrace_options;
-    setoptions(child_pid, ptrace_options)?;
-    trace!("Set tracing options for tracee {}", child_pid);
-    // TODO handle case with code being loaded dynamically in runtime (plugins)
-    let memory_regions = get_memory_regions(child_pid)?;
-    // TODO what about 32-bit mode?
-    let cs_x86 = Capstone::new()
-        .x86()
-        .mode(arch::x86::ArchMode::Mode64)
-        .syntax(arch::x86::ArchSyntax::Intel)
-        .detail(true)
-        .build()?;
-    trace!("Created capstone object");
-    let (_reachable_code, jump_addresses) = analyze(child_pid, &memory_regions, &cs_x86)?;
-    set_branch_breakpoints(child_pid, &jump_addresses)?;
-    let mut execution_log = ExecutionPathLog::new(child_pid)?;
-    trace(
-        child_pid,
-        &jump_addresses,
-        &memory_regions,
-        &mut execution_log,
-    )
-    // TODO remove breakpoints after canceling tracer for attach pid mode
-}
-
-#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-fn main() {
-    env_logger::init();
-    let args = Cli::from_args();
-    if let Err(top_e) = run(args) {
-        error!("{}", top_e.to_string());
-        let mut e: &dyn Error = top_e.borrow();
-        while let Some(source) = e.source() {
-            error!("Caused by: {}", source.to_string());
-            e = source;
         }
     }
 }
