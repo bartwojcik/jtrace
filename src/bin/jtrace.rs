@@ -11,12 +11,11 @@ use clap;
 use log::{debug, error, info, trace, warn};
 use nix::sys::ptrace::{attach, Options, setoptions, traceme};
 use nix::unistd::Pid;
-use serde::{Deserialize, Serialize};
 use structopt::StructOpt;
 
 use jtrace::{analyze, ExecutionPathLog, get_memory_regions, set_branch_breakpoints, trace};
 
-#[derive(StructOpt, Serialize, Deserialize)]
+#[derive(StructOpt)]
 /// Trace the execution path of a program.
 struct Cli {
     /// PID of the process to attach to
@@ -31,7 +30,7 @@ struct Cli {
 }
 
 
-fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
+fn run(args: Cli) -> Result<(), Box<dyn Error>> {
     let child_pid: Pid;
     let mut ptrace_options = Options::empty();
     if args.follow {

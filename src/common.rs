@@ -26,9 +26,11 @@ impl fmt::Display for ToolError {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct ExecutionPathHeader {
+pub struct ExecutionPathHeader {
     pub pid: pid_t,
     pub args: Vec<String>,
 }
 
-pub(crate) type ExecutionPathEntry = (pid_t, usize, bool);
+// TODO this should be more sophisticated?
+// pid, address, (branch) taken
+pub type ExecutionPathEntry = (pid_t, usize, bool);

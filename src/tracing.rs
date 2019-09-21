@@ -732,9 +732,6 @@ impl ExecutionPathLog {
     }
 
     fn write(&mut self, pid: Pid, address: usize, taken: bool) -> Result<(), Box<dyn Error>> {
-        // TODO this should be more sophisticated?
-        // pid, address, (branch) taken
-
         let entry: ExecutionPathEntry = (pid.as_raw(), address, taken);
         let encoded = serialize(&entry)?;
         let mut reservation = self.writer.spin_reserve(encoded.len());
