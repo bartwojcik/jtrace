@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use ahash::AHasher;
-use bincode::{serialize, serialize_into};
+use bincode::serialize_into;
 use capstone::{Capstone, Insn, InsnDetail, InsnIdInt, RegIdInt};
 use capstone::arch::ArchOperand;
 use capstone::arch::ArchOperand::X86Operand;
@@ -34,6 +34,7 @@ use nix::sys::wait::{wait, waitpid, WaitStatus};
 use nix::unistd::Pid;
 use proc_maps::{get_process_maps, MapRange};
 use spsc_bip_buffer::{bip_buffer_with_len, BipBufferWriter};
+use zerocopy::AsBytes;
 
 use InstructionType::*;
 
@@ -698,6 +699,7 @@ impl ExecutionPathLog {
         let header = ExecutionPathHeader { pid: pid.as_raw(), args: args().collect() };
         let mut buf_file = BufWriter::new(File::create(format!("{}.jtrace",
                                                                pid.as_raw().to_string()))?);
+        // TODO possibly add lz4 compression
         serialize_into(&mut buf_file, &header)?;
         // create a bipbuffer
         let (writer, mut reader) = bip_buffer_with_len(LOG_BIP_BUFFER_SIZE);
@@ -732,10 +734,10 @@ impl ExecutionPathLog {
     }
 
     fn write(&mut self, pid: Pid, address: usize, taken: bool) -> Result<(), Box<dyn Error>> {
-        let entry: ExecutionPathEntry = (pid.as_raw(), address, taken);
-        let encoded = serialize(&entry)?;
-        let mut reservation = self.writer.spin_reserve(encoded.len());
-        reservation.copy_from_slice(&encoded[..]);
+        let entry = ExecutionPathEntry(pid.as_raw(), address, taken as u8);
+        let bytes = entry.as_bytes();
+        let mut reservation = self.writer.spin_reserve(bytes.len());
+        reservation.copy_from_slice(bytes);
         reservation.send();
         self.handle.as_ref().unwrap().thread().unpark();
         Ok(())

@@ -3,12 +3,10 @@ use std::fmt;
 
 use libc::pid_t;
 use serde::{Deserialize, Serialize};
+use zerocopy::{AsBytes, FromBytes, Unaligned};
 
 #[derive(Debug)]
 pub enum ToolError {
-    ArchitectureNotSupported,
-    InvalidInstruction(usize),
-    AddressOutsideRegion(usize),
     AddressResolutionError(usize),
 }
 
@@ -17,9 +15,6 @@ impl Error for ToolError {}
 impl fmt::Display for ToolError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            ToolError::ArchitectureNotSupported => f.write_str("ArchitectureNotSupported"),
-            ToolError::InvalidInstruction(addr) => f.write_str(&format!("InvalidInstruction({})", addr)),
-            ToolError::AddressOutsideRegion(addr) => f.write_str(&format!("AddressOutsideRegion({})", addr)),
             ToolError::AddressResolutionError(addr) => f.write_str(&format!("AddressResolutionError({})", addr)),
         }
     }
@@ -32,5 +27,7 @@ pub struct ExecutionPathHeader {
 }
 
 // TODO this should be more sophisticated?
+#[derive(AsBytes, FromBytes, Unaligned)]
+#[repr(packed)]
 // pid, address, (branch) taken
-pub type ExecutionPathEntry = (pid_t, usize, bool);
+pub struct ExecutionPathEntry(pub pid_t, pub usize, pub u8);
