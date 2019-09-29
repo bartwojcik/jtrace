@@ -733,8 +733,8 @@ impl ExecutionPathLog {
         Ok(ExecutionPathLog { writer: writer, stop: stop, handle: Some(handle) })
     }
 
-    fn write(&mut self, pid: Pid, address: usize, taken: bool) -> Result<(), Box<dyn Error>> {
-        let entry = ExecutionPathEntry(pid.as_raw(), address, taken as u8);
+    fn write(&mut self, pid: Pid, offset: usize, taken: bool) -> Result<(), Box<dyn Error>> {
+        let entry = ExecutionPathEntry(pid.as_raw(), offset, taken as u8);
         let bytes = entry.as_bytes();
         let mut reservation = self.writer.spin_reserve(bytes.len());
         reservation.copy_from_slice(bytes);
@@ -761,14 +761,17 @@ fn handle_trap(
     let mut regs = tracee_get_registers(pid)?;
     let trap_addr = (regs.rip - 1) as usize;
     if let Ok(orig_instr_loc) = jump_addresses.binary_search_by_key(&trap_addr, |s| s.0) {
+        // TODO handle error case?
         let region = region_for_address(trap_addr, memory_regions).unwrap();
-        let region_offset = trap_addr - region.0.start();
+        let offset_in_region = trap_addr - region.0.start();
+        let region_file_offset = region.0.offset;
+        let file_offset = region_file_offset + offset_in_region;
         trace!(
             "Removing a trap at {:#x} in tracee {}'s memory",
             trap_addr,
             pid
         );
-        tracee_set_byte(pid, trap_addr, region.1[region_offset])?;
+        tracee_set_byte(pid, trap_addr, region.1[offset_in_region])?;
         regs.rip -= 1;
         tracee_set_registers(pid, &regs)?;
         trace!("Stepping tracee {}", pid);
@@ -785,10 +788,10 @@ fn handle_trap(
             tracee_save_registers(pid, &mut regs)?;
             let orig_instr_size = jump_addresses[orig_instr_loc].1;
             if regs.rip as usize == trap_addr + orig_instr_size as usize {
-                execution_log.write(pid, trap_addr, false)?;
+                execution_log.write(pid, file_offset, false)?;
                 trace!("Branch at {:#x} not taken by {}", trap_addr, pid);
             } else {
-                execution_log.write(pid, trap_addr, true)?;
+                execution_log.write(pid, file_offset, true)?;
                 trace!("Branch at {:#x} taken by {}", trap_addr, pid);
             }
         } else {
@@ -875,3 +878,4 @@ pub fn trace(
         }
     }
 }
+

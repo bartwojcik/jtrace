@@ -35,7 +35,7 @@ fn handle_header<B: BufRead>(f: &mut B) -> Result<(), Box<dyn Error>> {
 }
 
 fn handle_body<B: BufRead>(f: &mut B) -> Result<(), Box<dyn Error>> {
-    println!("<PID> <ADDR> <TAKEN>");
+    println!("PID\t\tOFFSET\t\tBRANCH");
     // loop and read log entries
     loop {
         let buf = f.fill_buf()?;
@@ -57,7 +57,7 @@ fn handle_entry(buf: &[u8], len: usize) {
         // print entry info
         if let Some(entry) = layout {
             start += size_of::<ExecutionPathEntry>();
-            println!("{} {:#x} {}", unsafe { entry.0 }, unsafe { entry.1 },
+            println!("{}\t\t{:#010x}\t{}", unsafe { entry.0 }, unsafe { entry.1 },
                      if entry.2 == 0 { "not taken" } else { "taken" });
 //            println!("{} {:#x} {}", entry.0, entry.1, entry.2 > 0);
         }
