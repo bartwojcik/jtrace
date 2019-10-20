@@ -22,20 +22,31 @@ struct Cli {
     input: PathBuf,
 }
 
-fn handle_header<B: BufRead>(f: &mut B) -> Result<(), Box<dyn Error>> {
+fn handle_header<B: BufRead>(f: &mut B) -> Result<ExecutionPathHeader, Box<dyn Error>> {
     let header: ExecutionPathHeader = deserialize_from(f)?;
     // print header info:
     println!("Root parent PID: {}", header.pid);
     print!("CLI: ");
-    for s in header.args {
+    for s in &header.args {
         print!("{} ", s);
     }
+    print!("\n");
+    println!("Memory map: ");
+    println!("START\t\tEND\t\tOFFSET\t\tFLAGS\t\tFILENAME");
+    for map in &header.maps {
+        println!("{:#010x}\t{:#010x}\t{:#010x}\t{}\t\t{:?}",
+                 map.range_start,
+                 map.range_end,
+                 map.offset,
+                 map.flags,
+                 map.pathname.as_ref());
+    }
     print!("\n\n");
-    Ok(())
+    Ok(header)
 }
 
-fn handle_body<B: BufRead>(f: &mut B) -> Result<(), Box<dyn Error>> {
-    println!("PID\t\tOFFSET\t\tBRANCH");
+fn handle_body<B: BufRead>(f: &mut B, header: &ExecutionPathHeader) -> Result<(), Box<dyn Error>> {
+    println!("PID\t\tADDR\t\tBRANCH");
     // loop and read log entries
     loop {
         let buf = f.fill_buf()?;
@@ -43,13 +54,24 @@ fn handle_body<B: BufRead>(f: &mut B) -> Result<(), Box<dyn Error>> {
         if len == 0 {
             break;
         }
-        handle_entry(buf, len);
+        handle_entry(buf, len, header);
         f.consume(len);
     }
     Ok(())
 }
 
-fn handle_entry(buf: &[u8], len: usize) {
+fn get_start_for_offset(offset: usize, header: &ExecutionPathHeader) -> Option<usize> {
+    for map in &header.maps {
+        if offset > map.offset
+            && offset < map.offset + (map.range_end - map.range_start)
+            && map.flags.contains("x") {
+            return Some(map.range_start);
+        }
+    }
+    None
+}
+
+fn handle_entry(buf: &[u8], len: usize, header: &ExecutionPathHeader) {
     let mut start = 0;
     while len - start >= size_of::<ExecutionPathEntry>() {
         let entry_buf = &buf[start..start + size_of::<ExecutionPathEntry>()];
@@ -57,19 +79,26 @@ fn handle_entry(buf: &[u8], len: usize) {
         // print entry info
         if let Some(entry) = layout {
             start += size_of::<ExecutionPathEntry>();
-            println!("{}\t\t{:#010x}\t{}", unsafe { entry.0 }, unsafe { entry.1 },
-                     if entry.2 == 0 { "not taken" } else { "taken" });
-//            println!("{} {:#x} {}", entry.0, entry.1, entry.2 > 0);
+            if let Some(addr_start) = get_start_for_offset(entry.1, header) {
+                let addr = addr_start + entry.1;
+                println!("{}\t\t{:#010x}\t{}", unsafe { entry.0 }, addr,
+                         if entry.2 == 0 { "not taken" } else { "taken" });
+            } else {
+                println!("{}\t\tinvalid\t{}", unsafe { entry.0 },
+                         if entry.2 == 0 { "not taken" } else { "taken" });
+            }
         }
-//        println!("start: {} len: {}", start, len);
     }
 }
 
 fn run(args: Cli) -> Result<(), Box<dyn Error>> {
-    let f = File::open(args.input)?;
+    let f = File::open(&args.input)?;
     let mut f = BufReader::new(f);
-    handle_header(&mut f)?;
-    handle_body(&mut f)?;
+    if let Some(filepath) = &args.input.to_str() {
+        println!("Reading data from {}", filepath);
+    }
+    let header = handle_header(&mut f)?;
+    handle_body(&mut f, &header)?;
     Ok(())
 }
 

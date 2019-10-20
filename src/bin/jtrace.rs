@@ -82,7 +82,7 @@ fn run(args: Cli) -> Result<(), Box<dyn Error>> {
     trace!("Created capstone object");
     let (_reachable_code, jump_addresses) = analyze(child_pid, &memory_regions, &cs_x86)?;
     set_branch_breakpoints(child_pid, &jump_addresses)?;
-    let mut execution_log = ExecutionPathLog::new(child_pid)?;
+    let mut execution_log = ExecutionPathLog::new(child_pid, &memory_regions)?;
     trace(
         child_pid,
         &jump_addresses,

@@ -25,7 +25,7 @@ use capstone::arch::x86::X86OperandType;
 use capstone::arch::x86::X86OperandType::*;
 use capstone::prelude::*;
 use crossbeam::utils::Backoff;
-use log::{debug, error, info, trace, warn};
+use log::{debug, info, trace, warn};
 use nix::errno::Errno;
 use nix::sys::ptrace::{cont, Event, read, Request, RequestType, step, write};
 use nix::sys::signal::{SIGCHLD, SIGSTOP, SIGTRAP};
@@ -38,7 +38,7 @@ use zerocopy::AsBytes;
 
 use InstructionType::*;
 
-use crate::common::{ExecutionPathEntry, ExecutionPathHeader, ToolError};
+use crate::common::{ExecutionPathEntry, ExecutionPathHeader, ToolError, SerdeMapRange};
 
 fn tracee_get_byte(pid: Pid, addr: usize) -> Result<u8, Box<dyn Error>> {
     let aligned_addr = addr / size_of::<usize>() * size_of::<usize>();
@@ -216,6 +216,10 @@ fn int_to_ptrace_event(value: i32) -> Option<Event> {
 
 type MemoryRegion = (MapRange, Vec<u8>);
 type MemoryRegions = Vec<MemoryRegion>;
+
+fn serializable_map_info(memory_regions: &MemoryRegions) -> Vec<SerdeMapRange> {
+    memory_regions.into_iter().map(|x| SerdeMapRange::new(&x.0)).collect()
+}
 
 pub fn get_memory_regions(pid: Pid) -> Result<MemoryRegions, Box<dyn Error>> {
     let maps = get_process_maps(pid.as_raw())?;
@@ -695,10 +699,15 @@ pub struct ExecutionPathLog {
 }
 
 impl ExecutionPathLog {
-    pub fn new(pid: Pid) -> Result<Self, Box<dyn Error>> {
-        let header = ExecutionPathHeader { pid: pid.as_raw(), args: args().collect() };
+    pub fn new(pid: Pid, memory_regions: &MemoryRegions) -> Result<Self, Box<dyn Error>> {
         let mut buf_file = BufWriter::new(File::create(format!("{}.jtrace",
                                                                pid.as_raw().to_string()))?);
+        let serializable_maps = serializable_map_info(memory_regions);
+        let header = ExecutionPathHeader {
+            pid: pid.as_raw(),
+            args: args().collect(),
+            maps: serializable_maps,
+        };
         // TODO possibly add lz4 compression
         serialize_into(&mut buf_file, &header)?;
         // create a bipbuffer

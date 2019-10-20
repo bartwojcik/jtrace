@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt;
 
 use libc::pid_t;
+use proc_maps::MapRange;
 use serde::{Deserialize, Serialize};
 use zerocopy::{AsBytes, FromBytes, Unaligned};
 
@@ -20,10 +21,33 @@ impl fmt::Display for ToolError {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SerdeMapRange {
+    pub range_start: usize,
+    pub range_end: usize,
+    pub offset: usize,
+    pub flags: String,
+    pub pathname: Option<String>,
+}
+
+impl SerdeMapRange {
+    pub fn new(original: &MapRange) -> Self {
+        SerdeMapRange {
+            range_start: original.start(),
+            range_end: original.start() + original.size(),
+            offset: original.offset,
+            flags: original.flags.clone(),
+            pathname: original.filename().clone(),
+        }
+    }
+}
+
+
 #[derive(Serialize, Deserialize)]
 pub struct ExecutionPathHeader {
     pub pid: pid_t,
     pub args: Vec<String>,
+    pub maps: Vec<SerdeMapRange>,
 }
 
 // TODO this should be more sophisticated?
