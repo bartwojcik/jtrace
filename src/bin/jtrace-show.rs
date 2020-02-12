@@ -54,8 +54,8 @@ fn handle_body<B: BufRead>(f: &mut B, header: &ExecutionPathHeader) -> Result<()
         if len == 0 {
             break;
         }
-        handle_entry(buf, len, header);
-        f.consume(len);
+        let consumed = handle_entry(buf, header);
+        f.consume(consumed);
     }
     Ok(())
 }
@@ -71,9 +71,9 @@ fn get_start_for_offset(offset: usize, header: &ExecutionPathHeader) -> Option<u
     None
 }
 
-fn handle_entry(buf: &[u8], len: usize, header: &ExecutionPathHeader) {
+fn handle_entry(buf: &[u8], header: &ExecutionPathHeader) -> usize {
     let mut start = 0;
-    while len - start >= size_of::<ExecutionPathEntry>() {
+    while buf.len() - start >= size_of::<ExecutionPathEntry>() {
         let entry_buf = &buf[start..start + size_of::<ExecutionPathEntry>()];
         let layout = LayoutVerified::<&[u8], ExecutionPathEntry>::new(entry_buf);
         // print entry info
@@ -89,6 +89,7 @@ fn handle_entry(buf: &[u8], len: usize, header: &ExecutionPathHeader) {
             }
         }
     }
+    buf.len() - start
 }
 
 fn run(args: Cli) -> Result<(), Box<dyn Error>> {

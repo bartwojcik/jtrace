@@ -50,9 +50,7 @@ pub struct ExecutionPathHeader {
     pub maps: Vec<SerdeMapRange>,
 }
 
-// TODO this should be more sophisticated?
-// TODO address/offset should be the same between runs even with PIE and ASLR
-#[derive(AsBytes, FromBytes, Unaligned)]
+#[derive(AsBytes, FromBytes, Unaligned, Clone, Copy)]
 #[repr(packed)]
 // pid, offset to executable, (branch) taken
 pub struct ExecutionPathEntry(pub pid_t, pub usize, pub u8);

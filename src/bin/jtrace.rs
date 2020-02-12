@@ -25,7 +25,6 @@ struct Cli {
     #[structopt(short = "f", long = "follow")]
     follow: bool,
     /// The command to be executed
-    #[structopt(raw(multiple = "true"))]
     command: Vec<String>,
 }
 
