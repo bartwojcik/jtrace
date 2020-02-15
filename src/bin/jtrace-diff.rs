@@ -113,118 +113,115 @@ fn map_by_set_similarity(left_map: &ExecutionMap, right_map: &ExecutionMap) -> P
     pid_map
 }
 
-type DiffedExecutionLog = (ExecutionLog, Vec<bool>);
-
-fn middle_snake(left_sequence: &[ExecutionEntry], right_sequence: &[ExecutionEntry])
-                -> (i64, (i64, i64), (i64, i64)) {
-    let n = left_sequence.len() as i64;
-    let m = left_sequence.len() as i64;
-    let size_max = n + m;
-    let delta = n - m;
-    let v_size = 2 * min(n, m) + 2;
-    let mut v_f = vec![-1; v_size as usize];
-    let mut v_b = vec![-1; v_size as usize];
-    v_f[1] = 0;
-    v_b[1] = 0;
-    for d in 0..(size_max / 2 + (size_max % 2) + 1) {
-        let mut k = -(d - 2 * max(0, d - m));
-        while k <= d - 2 * max(0, d - n) {
-            let mut x;
-            // select better incoming path
-            if k == -d || k != d
-                && v_f[((k - 1) % v_size) as usize] < v_f[((k + 1) % v_size) as usize] {
-                x = v_f[((k + 1) % v_size) as usize];
-            } else {
-                x = v_f[((k - 1) % v_size) as usize] + 1;
-            }
-            let mut y = x - k;
-            // save the coordinates of the snake's starting point
-            let x_i = x;
-            let y_i = y;
-            // follow the diagonals
-            while x < n && y < m && left_sequence[x as usize] == right_sequence[y as usize] {
-                x += 1;
-                y += 1;
-            }
-            // fill the new best value
-            v_f[(k % v_size) as usize] = x;
-            let inverse_k = -(k - delta);
-            if delta % 2 == 1 && inverse_k >= -(d - 1) && inverse_k <= (d - 1)
-                && v_f[(k % v_size) as usize] + v_b[(inverse_k % v_size) as usize] >= n {
-                return (2 * d - 1, (x_i, y_i), (x, y));
-            }
-            k += 2;
-        }
-        k = -(d - 2 * max(0, d - m));
-        while k <= d - 2 * max(0, d - n) {
-            let mut x;
-            // select better incoming path
-            if k == -d || k != d
-                && v_b[((k - 1) % v_size) as usize] < v_b[((k + 1) % v_size) as usize] {
-                x = v_b[((k + 1) % v_size) as usize];
-            } else {
-                x = v_b[((k - 1) % v_size) as usize] + 1;
-            }
-            let mut y = x - k;
-            // save the coordinates of the snake's starting point
-            let x_i = x;
-            let y_i = y;
-            // follow the diagonals
-            while x < n && y < m
-                && left_sequence[(n - x - 1) as usize] == right_sequence[(m - y - 1) as usize] {
-                x += 1;
-                y += 1;
-            }
-            // fill the new best value
-            v_b[(k % v_size) as usize] = x;
-            let inverse_k = -(k - delta);
-            if delta % 2 == 1 && inverse_k >= -d && inverse_k <= d
-                && v_b[(k % v_size) as usize] + v_b[(inverse_k % v_size) as usize] >= n {
-                return (2 * d, (n - x, m - y), (n - x_i, m - y_i));
-            }
-            k += 2;
-        }
-    }
-    unreachable!();
+fn mod_idx(n: i64, m: i64) -> usize {
+    debug_assert!(m > 0, "divisor is negative");
+    (((n % m) + m) % m) as usize
 }
 
-fn lcs(left_sequence: &[ExecutionEntry],
-       right_sequence: &[ExecutionEntry],
-       output: &mut ExecutionLog) {
-    let n = left_sequence.len();
-    let m = right_sequence.len();
-    if n > 0 && m > 0 {
-        let (d, (x, y), (u, v)) = middle_snake(left_sequence, right_sequence);
-        let (x, y, u, v) = (x as usize, y as usize, u as usize, v as usize);
-        if d > 1 {
-            lcs(&left_sequence[0..x], &right_sequence[0..y], output);
-            output.extend_from_slice(&left_sequence[x..u]);
-            lcs(&left_sequence[u..n], &right_sequence[v..m], output);
-        } else if right_sequence.len() > left_sequence.len() {
-            output.extend_from_slice(&left_sequence[0..n]);
-        } else {
-            output.extend_from_slice(&right_sequence[0..m]);
-        }
-    }
+enum DiffOperation {
+    Deletion { pos_old: usize },
+    Insertion { pos_old: usize, pos_new: usize },
 }
 
-/// Uses the recursive EW Myers's algorithm from the 1986 paper
-/// 'AnO(ND) difference algorithm and its variations'
-/// for finding the LCS.
-/// Includes refinements from https://blog.robertelder.org/diff-algorithm/
-/// see also:
+type DiffResults = Vec<DiffOperation>;
+
+/// Ported to Rust from this Python code:
 /// https://github.com/RobertElderSoftware/roberteldersoftwarediff/blob/master/myers_diff_and_variations.py
-fn find_lcs(left_log: &ExecutionLog, right_log: &ExecutionLog) -> ExecutionLog {
-    let mut lcsed = ExecutionLog::new();
-    lcs(left_log, right_log, &mut lcsed);
-    lcsed
+fn diff<T: Eq + Clone>(left_sequence: &[T], right_sequence: &[T],
+                       i: Option<usize>, j: Option<usize>, results: &mut DiffResults) {
+    let i = i.unwrap_or(0);
+    let j = j.unwrap_or(0);
+    let l_len = left_sequence.len() as i64;
+    let r_len = right_sequence.len() as i64;
+    let sum_l = l_len + r_len;
+    let v_size = 2 * min(l_len, r_len) + 2;
+    if l_len > 0 && r_len > 0 {
+        let delta = l_len - r_len;
+        let mut v_forward = vec![0; v_size as usize];
+        let mut v_backward = vec![0; v_size as usize];
+        for h in 0..sum_l / 2 + sum_l % 2 + 1 {
+            for &forward in &[true, false] {
+                let (v_a, v_b, p, q);
+                if forward {
+                    v_a = &mut v_forward;
+                    v_b = &v_backward;
+                    p = 1;
+                    q = 1;
+                } else {
+                    v_a = &mut v_backward;
+                    v_b = &v_forward;
+                    p = 0;
+                    q = -1;
+                }
+                let mut k = -(h - 2 * max(0, h - r_len));
+                while k <= h - 2 * max(0, h - l_len) {
+                    // select better incoming path
+                    let c_idx = mod_idx(k, v_size); // current k line
+                    let a_idx = mod_idx(k + 1, v_size); // k line above
+                    let b_idx = mod_idx(k - 1, v_size); // k line below
+                    let mut a = if k == -h || k != h && v_a[b_idx] < v_a[a_idx] {
+                        v_a[a_idx]
+                    } else {
+                        v_a[b_idx] + 1
+                    };
+                    let mut b = a - k;
+                    // save the coordinates of the snake's starting point
+                    let (s, t) = (a, b);
+                    // follow the diagonals
+                    while a < l_len && b < r_len
+                        && left_sequence[((1 - p) * l_len + q * a + (p - 1)) as usize]
+                        == right_sequence[((1 - p) * r_len + q * b + (p - 1)) as usize] {
+                        a += 1;
+                        b += 1;
+                    }
+                    // update best x array
+                    v_a[c_idx] = a;
+                    let inverse_k = -(k - delta);
+                    if sum_l % 2 == p && inverse_k >= -(h - p) && inverse_k <= h - p
+                        && v_a[c_idx] + v_b[c_idx] >= l_len {
+                        let (l_len, r_len) = (l_len as usize, r_len as usize);
+                        let (d, x, y, u, v) = if forward {
+                            (2 * h - 1, s as usize, t as usize, a as usize, b as usize)
+                        } else {
+                            (2 * h, l_len - a as usize, r_len - b as usize,
+                             l_len - s as usize, r_len - t as usize)
+                        };
+                        if d > 1 || x != u && y != u {
+                            diff(&left_sequence[0..x], &right_sequence[0..y],
+                                 Some(i), Some(j), results);
+                            diff(&left_sequence[u..l_len], &right_sequence[v..r_len],
+                                 Some(i + u), Some(j + v), results);
+                        } else if r_len > l_len {
+                            diff(&[], &right_sequence[l_len..r_len],
+                                 Some(i + l_len), Some(j + l_len), results);
+                        } else if r_len < l_len {
+                            diff(&left_sequence[r_len..l_len], &[],
+                                 Some(i + r_len), Some(j + r_len), results);
+                        }
+                    }
+                    k += 2;
+                }
+            }
+        }
+    } else if l_len > 0 {
+        for n in 0..l_len as usize {
+            results.push(DiffOperation::Deletion { pos_old: i + n })
+        }
+    } else {
+        for n in 0..r_len as usize {
+            results.push(DiffOperation::Insertion { pos_old: i, pos_new: j + n })
+        }
+    }
 }
 
 
-//fn find_difference(left_log: &ExecutionLog, right_log: &ExecutionLog)
-//                   -> DiffedExecutionLog {
-//
-//}
+fn find_difference<T: Eq + Clone>(left_sequence: &[T],
+                          right_sequence: &[T])
+                   -> DiffResults {
+    let mut results = DiffResults::new();
+    diff(left_sequence, right_sequence, None, None, &mut results);
+    results
+}
 
 fn run(args: Cli) -> Result<(), Box<dyn Error>> {
     let mut f_left = BufReader::new(File::open(&args.left_input)?);
