@@ -20,6 +20,7 @@ libc = "0.2.66"
 log = "0.4.8"
 nix = "0.17.0"
 proc-maps = "0.1.6"
+rand = "0.7.3"
 serde = { version = "1.0.104", features = ["derive"] }
 spsc-bip-buffer = "0.2.1"
 structopt = "0.3.9"
