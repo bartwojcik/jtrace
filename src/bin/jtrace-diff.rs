@@ -2,6 +2,7 @@ use std::borrow::Borrow;
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::fmt;
 use std::fs::File;
 use std::hash::BuildHasherDefault;
 use std::io::{BufRead, BufReader};
@@ -10,6 +11,7 @@ use std::path::PathBuf;
 
 use ahash::AHasher;
 use bincode::deserialize_from;
+use console::style;
 use libc::pid_t;
 use log::{debug, error, info, trace, warn};
 use structopt::StructOpt;
@@ -20,10 +22,10 @@ use jtrace::{ExecutionPathEntry, ExecutionPathHeader};
 #[derive(StructOpt)]
 /// Compare two saved execution paths of a program.
 struct Cli {
-    /// First file containing the saved execution path
+    /// A file containing the saved base execution path
     #[structopt(parse(from_os_str))]
     left_input: PathBuf,
-    /// First file containing the saved execution path
+    /// A file containing the saved execution path to be compared
     #[structopt(parse(from_os_str))]
     right_input: PathBuf,
 }
@@ -122,8 +124,8 @@ fn mod_idx(n: i64, m: i64) -> usize {
 
 #[derive(Debug)]
 enum DiffOperation {
-    Deletion { pos_old: usize },
-    Insertion { pos_old: usize, pos_new: usize },
+    Deletion { pos_left: usize },
+    Insertion { pos_left: usize, pos_right: usize },
 }
 
 type DiffResults = Vec<DiffOperation>;
@@ -340,13 +342,13 @@ fn diff<T: Eq + Clone>(
         }
     } else if l_len > 0 {
         for n in 0..l_len as usize {
-            results.push(DiffOperation::Deletion { pos_old: i + n })
+            results.push(DiffOperation::Deletion { pos_left: i + n })
         }
     } else {
         for n in 0..r_len as usize {
             results.push(DiffOperation::Insertion {
-                pos_old: i,
-                pos_new: j + n,
+                pos_left: i,
+                pos_right: j + n,
             })
         }
     }
@@ -370,6 +372,72 @@ fn find_difference<T: Eq + Clone>(left_sequence: &[T], right_sequence: &[T]) -> 
     results
 }
 
+fn display_differences(diffs: &DiffResults, left_log: &ExecutionLog, right_log: &ExecutionLog) {
+    // iterates over left sequence
+    let mut i = 0;
+    // iterates over the differences
+    let mut j = 0;
+    while j < diffs.len() {
+        let next_pos = match diffs[j] {
+            DiffOperation::Deletion { pos_left } => pos_left,
+            DiffOperation::Insertion {
+                pos_left,
+                pos_right: _,
+            } => pos_left,
+        };
+        if i == next_pos {
+            // display insertion or deletion
+            match diffs[j] {
+                DiffOperation::Deletion { pos_left: _ } => {
+                    i += 1;
+                    println!(
+                        "{}:\t- {}",
+                        i,
+                        style(format!(
+                            "{:#010x}\t{}",
+                            left_log[i].0,
+                            if left_log[i].1 == 0 {
+                                "not taken"
+                            } else {
+                                "taken"
+                            }
+                        ))
+                        .red()
+                    );
+                }
+                DiffOperation::Insertion {
+                    pos_left: _,
+                    pos_right: x,
+                } => {
+                    println!(
+                        "{}:\t+ {}",
+                        i,
+                        style(format!(
+                            "{:#010x}\t{}",
+                            right_log[x].0,
+                            if left_log[i].1 == 0 {
+                                "not taken"
+                            } else {
+                                "taken"
+                            }
+                        ))
+                        .green()
+                    );
+                }
+            };
+            j += 1;
+        } else if i == next_pos - 1 {
+            println!("...");
+            i += 1;
+        } else {
+            i = next_pos - 1;
+        }
+    }
+    if i < left_log.len() - 1 {
+        println!("...");
+    }
+}
+
 fn run(args: Cli) -> Result<(), Box<dyn Error>> {
     let mut f_left = BufReader::new(File::open(&args.left_input)?);
     let mut f_right = BufReader::new(File::open(&args.right_input)?);
@@ -385,9 +453,11 @@ fn run(args: Cli) -> Result<(), Box<dyn Error>> {
     let pid_map = map_by_set_similarity(&left_map, &right_map);
     // find and print differences
     for (left_pid, right_pid) in pid_map {
-        //        let differences = find_difference(left_map.get(&left_pid).unwrap(),
-        //                                          right_map.get(&right_pid).unwrap());
-        // TODO print differences
+        let left_log = left_map.get(&left_pid).unwrap();
+        let right_log = right_map.get(&right_pid).unwrap();
+        let differences = find_difference(left_log, right_log);
+        println!("Diffrences between PID {} and PID {}:", left_pid, right_pid);
+        display_differences(&differences, &left_log, &right_log);
     }
     // TODO do not ignore unmapped pids
     Ok(())
@@ -409,7 +479,6 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use rand::distributions::Alphanumeric;
     use rand::{thread_rng, Rng};
 
     use super::*;
@@ -420,24 +489,26 @@ mod tests {
         difference: &[DiffOperation],
     ) -> Vec<T> {
         let mut result = Vec::<T>::new();
+        // iterates over the left sequence
         let mut i = 0;
+        // iterates over the differences
         let mut j = 0;
         while j < difference.len() {
             let next_pos = match difference[j] {
-                DiffOperation::Deletion { pos_old: x } => x,
+                DiffOperation::Deletion { pos_left: x } => x,
                 DiffOperation::Insertion {
-                    pos_old: x,
-                    pos_new: _,
+                    pos_left: x,
+                    pos_right: _,
                 } => x,
             };
             if i == next_pos {
                 match difference[j] {
-                    DiffOperation::Deletion { pos_old: _ } => {
+                    DiffOperation::Deletion { pos_left: _ } => {
                         i += 1;
                     }
                     DiffOperation::Insertion {
-                        pos_old: _,
-                        pos_new: x,
+                        pos_left: _,
+                        pos_right: x,
                     } => {
                         result.push(right_sequence[x].clone());
                     }
@@ -530,12 +601,21 @@ mod tests {
     }
 
     #[test]
-    fn test_random_strs() {
-        for i in 0..1000 {
+    fn test_perturbed_strs() {
+        for _ in 0..1000 {
             let mut rng = thread_rng();
             let str1 = random_string(rng.gen_range(10, 100));
             let (str2, modified) = random_perturbation(&str1, rng.gen_range(0.05, 0.5));
             test_two_strs(&str1, &str2, modified * 2);
         }
+    }
+
+    #[test]
+    fn test_diff_len() {
+        test_two_strs(
+            "nitWVMHDydSTnFbvsSFDTiQfUMFkLTyelTfZOESYyPYaJnpTqMfakxX",
+            "n8tWVMHDyd6TnFbvsSFDTiQ5UMF0LTy1mjKVqWlTf5OESYyPY8JnpTqMfak3X",
+            22,
+        );
     }
 }
