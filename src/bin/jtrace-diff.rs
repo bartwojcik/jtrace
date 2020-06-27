@@ -441,11 +441,6 @@ fn display_differences(diffs: &DiffResults, left_log: &ExecutionLog, right_log: 
 fn run(args: Cli) -> Result<(), Box<dyn Error>> {
     let mut f_left = BufReader::new(File::open(&args.left_input)?);
     let mut f_right = BufReader::new(File::open(&args.right_input)?);
-    if let Some(left_filepath) = &args.left_input.to_str() {
-        if let Some(right_filepath) = &args.right_input.to_str() {
-            println!("Reading data from:\n{}\n{}", left_filepath, right_filepath);
-        }
-    }
     let left_header: ExecutionPathHeader = deserialize_from(&mut f_left)?;
     let right_header: ExecutionPathHeader = deserialize_from(&mut f_right)?;
     let left_map = read_entries(&mut f_left)?;

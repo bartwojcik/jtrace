@@ -89,15 +89,12 @@ fn handle_entry(buf: &[u8], header: &ExecutionPathHeader) -> usize {
             }
         }
     }
-    buf.len() - start
+    start
 }
 
 fn run(args: Cli) -> Result<(), Box<dyn Error>> {
     let f = File::open(&args.input)?;
     let mut f = BufReader::new(f);
-    if let Some(filepath) = &args.input.to_str() {
-        println!("Reading data from {}", filepath);
-    }
     let header = handle_header(&mut f)?;
     handle_body(&mut f, &header)?;
     Ok(())
